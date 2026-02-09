@@ -9,15 +9,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from pathlib import Path
-import sys
-# 添加项目根目录到路径
-current_dir = Path(__file__).parent
-project_root = current_dir.parent
-sys.path.insert(0, str(project_root))
-
-# 使用绝对导入
-from cs336_basics.bpe import ByteLevelBPE
+from cs336_basics import bpe
 
 def run_linear(
     d_in: int,
@@ -598,5 +590,5 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    tokenizer = ByteLevelBPE()
+    tokenizer = bpe.ByteLevelBPE()
     return tokenizer.train(input_path, vocab_size, special_tokens)

@@ -1,5 +1,6 @@
 import regex as re
 from typing import Dict, List, Tuple
+import time
 
 class ByteLevelBPE:
   def __init__(self):
