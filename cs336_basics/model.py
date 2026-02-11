@@ -11,13 +11,16 @@ class Linear(nn.Module):
     forward: y = xW^T.
     '''
 
+
     def __init__(self, in_features, out_features, device=None, dtype=None):
+        # 注意对外提供的接口是: in在左, out在右.
+        # 内部存储是反的, forward实际实现是反的, 但外部不需要知道这个事情.
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         
         std = sqrt(2.0 / (in_features + out_features))
-        self.weights = trunc_normal_(
+        self.weight = trunc_normal_(
             nn.Parameter(
                 torch.empty(out_features, in_features, device=device, dtype=dtype)
             ),
@@ -28,11 +31,11 @@ class Linear(nn.Module):
         )
 
     def forward(self, x):
-        if x.device != self.weights.device:
-            self.weights = self.weights.to(x.device)
+        if x.device != self.weight.device:
+            self.weight = self.weight.to(x.device)
 
-        # return x @ self.weights.T
-        return einsum(x, self.weights, '... in_features, out_features in_features -> ... out_features')
+        # return x @ self.weight.T
+        return einsum(x, self.weight, '... in_features, out_features in_features -> ... out_features')
 
 class Embedding(nn.Module):
     """
@@ -100,3 +103,28 @@ class RMSNorm(nn.Module):
         rms_a = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         result = x / rms_a * self.weight
         return result.to(in_dtype)
+
+class SiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff = None, device=None,dtype=None):
+        super().__init__()
+        if d_ff == None:
+            # 8 / 3 * d_model并向上取整到64的倍数
+            d_ff = int((8 / 3) * d_model)
+            d_ff = ((d_ff + 63) // 64) * 64
+
+        # in在左, out在右
+        # 内部存储是反的, 但 **在SwiGLU层, 不需要考虑这个事情**
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
+        self.w3 = Linear(d_model, d_ff, device, dtype)
+
+    def forward(self, x):
+        silu = SiLU()
+        return self.w2((silu(self.w1(x)) * self.w3(x)))
