@@ -31,7 +31,7 @@ def run_linear(
     """
 
     linear_layer = model.Linear(d_in, d_out)
-    state_dict = {'weights': weights}
+    state_dict = {'weight': weights}
     linear_layer.load_state_dict(state_dict, strict=False)
     return linear_layer(in_features)
 
@@ -320,8 +320,285 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
 
+    block = model.TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        theta=theta,
+        max_seq_len=max_seq_len
+    )
+    
+    state_dict = {
+        'norm1.weight': weights['ln1.weight'],
+        'norm2.weight': weights['ln2.weight'],
+        'attention.W_q.weight': weights['attn.q_proj.weight'],
+        'attention.W_k.weight': weights['attn.k_proj.weight'],
+        'attention.W_v.weight': weights['attn.v_proj.weight'],
+        'attention.W_o.weight': weights['attn.output_proj.weight'],
+        'ffn.w1.weight': weights['ffn.w1.weight'],
+        'ffn.w2.weight': weights['ffn.w2.weight'],
+        'ffn.w3.weight': weights['ffn.w3.weight'],
+    }
+    
+    block.load_state_dict(state_dict)
+    
+    batch_size, seq_len = in_features.shape[0], in_features.shape[1]
+    token_positions = torch.arange(seq_len, device=in_features.device)
+    token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+    
+    with torch.no_grad():
+        output = block(in_features, token_positions)
+    
+    return output
+
+
+def debug_transformer_weights(model, ref_weights, num_layers):
+    """
+    独立调试函数：对比TransformerLM模型权重与参考权重
+    
+    Args:
+        model: 你的TransformerLM模型实例
+        ref_weights: 测试传进来的weights字典
+        num_layers: 层数
+    """
+    print("\n" + "=" * 80)
+    print("🔍 TRANSFORMER LM 权重调试")
+    print("=" * 80)
+    
+    total_mismatches = 0
+    
+    # 1. Token Embedding
+    print("\n【1. Token Embedding】")
+    print("-" * 50)
+    model_w = model.token_embedding.weight
+    ref_w = ref_weights['token_embeddings.weight']
+    print(f"  模型: shape {tuple(model_w.shape)}")
+    print(f"  参考: shape {tuple(ref_w.shape)}")
+    if model_w.shape == ref_w.shape:
+        diff = (model_w - ref_w).abs().max().item()
+        print(f"  ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        if diff < 1e-5:
+            print(f"  ✅ 数值一致")
+        else:
+            print(f"  ⚠️ 数值差异较大")
+            total_mismatches += 1
+    else:
+        print(f"  ❌ 形状不匹配！")
+        total_mismatches += 1
+    
+    # 2. 遍历每一层
+    for layer_idx in range(num_layers):
+        print(f"\n{'='*60}")
+        print(f"【2.{layer_idx} Layer {layer_idx}】")
+        print(f"{'='*60}")
+        
+        layer = model.layers[layer_idx]
+        prefix = f'layers.{layer_idx}'
+        
+        # ----- Attention 权重 -----
+        print("\n  📍 MultiHeadSelfAttention")
+        
+        # Q
+        model_q = layer.attention.W_q.weight
+        ref_q = ref_weights[f'{prefix}.attn.q_proj.weight']
+        print(f"\n    [Q]")
+        print(f"      模型: {tuple(model_q.shape)}")
+        print(f"      参考: {tuple(ref_q.shape)}")
+        if model_q.shape == ref_q.shape:
+            diff = (model_q - ref_q).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_q.shape == ref_q.T.shape:
+            diff = (model_q - ref_q.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配 (模型{model_q.shape} vs 参考{ref_q.shape})")
+            total_mismatches += 1
+        
+        # K
+        model_k = layer.attention.W_k.weight
+        ref_k = ref_weights[f'{prefix}.attn.k_proj.weight']
+        print(f"\n    [K]")
+        print(f"      模型: {tuple(model_k.shape)}")
+        print(f"      参考: {tuple(ref_k.shape)}")
+        if model_k.shape == ref_k.shape:
+            diff = (model_k - ref_k).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_k.shape == ref_k.T.shape:
+            diff = (model_k - ref_k.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # V
+        model_v = layer.attention.W_v.weight
+        ref_v = ref_weights[f'{prefix}.attn.v_proj.weight']
+        print(f"\n    [V]")
+        print(f"      模型: {tuple(model_v.shape)}")
+        print(f"      参考: {tuple(ref_v.shape)}")
+        if model_v.shape == ref_v.shape:
+            diff = (model_v - ref_v).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_v.shape == ref_v.T.shape:
+            diff = (model_v - ref_v.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # O
+        model_o = layer.attention.W_o.weight
+        ref_o = ref_weights[f'{prefix}.attn.output_proj.weight']
+        print(f"\n    [O]")
+        print(f"      模型: {tuple(model_o.shape)}")
+        print(f"      参考: {tuple(ref_o.shape)}")
+        if model_o.shape == ref_o.shape:
+            diff = (model_o - ref_o).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_o.shape == ref_o.T.shape:
+            diff = (model_o - ref_o.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # ----- FFN 权重 -----
+        print("\n  📍 SwiGLU")
+        
+        # w1
+        model_w1 = layer.ffn.w1.weight
+        ref_w1 = ref_weights[f'{prefix}.ffn.w1.weight']
+        print(f"\n    [w1]")
+        print(f"      模型: {tuple(model_w1.shape)}")
+        print(f"      参考: {tuple(ref_w1.shape)}")
+        if model_w1.shape == ref_w1.shape:
+            diff = (model_w1 - ref_w1).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_w1.shape == ref_w1.T.shape:
+            diff = (model_w1 - ref_w1.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配 (期望 {ref_w1.shape} 或 {ref_w1.T.shape})")
+            total_mismatches += 1
+        
+        # w2
+        model_w2 = layer.ffn.w2.weight
+        ref_w2 = ref_weights[f'{prefix}.ffn.w2.weight']
+        print(f"\n    [w2]")
+        print(f"      模型: {tuple(model_w2.shape)}")
+        print(f"      参考: {tuple(ref_w2.shape)}")
+        if model_w2.shape == ref_w2.shape:
+            diff = (model_w2 - ref_w2).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_w2.shape == ref_w2.T.shape:
+            diff = (model_w2 - ref_w2.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # w3
+        model_w3 = layer.ffn.w3.weight
+        ref_w3 = ref_weights[f'{prefix}.ffn.w3.weight']
+        print(f"\n    [w3]")
+        print(f"      模型: {tuple(model_w3.shape)}")
+        print(f"      参考: {tuple(ref_w3.shape)}")
+        if model_w3.shape == ref_w3.shape:
+            diff = (model_w3 - ref_w3).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        elif model_w3.shape == ref_w3.T.shape:
+            diff = (model_w3 - ref_w3.T).abs().max().item()
+            print(f"      🔄 需要转置 | 转置后差异: {diff:.6f}")
+            total_mismatches += 1
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # ----- RMSNorm -----
+        print("\n  📍 RMSNorm")
+        
+        # norm1
+        model_norm1 = layer.norm1.weight
+        ref_norm1 = ref_weights[f'{prefix}.ln1.weight']
+        print(f"\n    [norm1]")
+        print(f"      模型: {tuple(model_norm1.shape)}")
+        print(f"      参考: {tuple(ref_norm1.shape)}")
+        if model_norm1.shape == ref_norm1.shape:
+            diff = (model_norm1 - ref_norm1).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+        
+        # norm2
+        model_norm2 = layer.norm2.weight
+        ref_norm2 = ref_weights[f'{prefix}.ln2.weight']
+        print(f"\n    [norm2]")
+        print(f"      模型: {tuple(model_norm2.shape)}")
+        print(f"      参考: {tuple(ref_norm2.shape)}")
+        if model_norm2.shape == ref_norm2.shape:
+            diff = (model_norm2 - ref_norm2).abs().max().item()
+            print(f"      ✅ 形状匹配 | 最大差异: {diff:.6f}")
+        else:
+            print(f"      ❌ 形状不匹配")
+            total_mismatches += 1
+    
+    # 3. Final Layer Norm
+    print(f"\n{'='*60}")
+    print("【3. Final Layer Norm】")
+    print(f"{'='*60}")
+    model_final = model.final_norm.weight
+    ref_final = ref_weights['ln_final.weight']
+    print(f"  模型: {tuple(model_final.shape)}")
+    print(f"  参考: {tuple(ref_final.shape)}")
+    if model_final.shape == ref_final.shape:
+        diff = (model_final - ref_final).abs().max().item()
+        print(f"  ✅ 形状匹配 | 最大差异: {diff:.6f}")
+    else:
+        print(f"  ❌ 形状不匹配")
+        total_mismatches += 1
+    
+    # 4. LM Head
+    print(f"\n{'='*60}")
+    print("【4. LM Head】")
+    print(f"{'='*60}")
+    model_head = model.lm_head.weight
+    ref_head = ref_weights['lm_head.weight']
+    print(f"  模型: {tuple(model_head.shape)}")
+    print(f"  参考: {tuple(ref_head.shape)}")
+    if model_head.shape == ref_head.shape:
+        diff = (model_head - ref_head).abs().max().item()
+        print(f"  ✅ 形状匹配 | 最大差异: {diff:.6f}")
+    elif model_head.shape == ref_head.T.shape:
+        diff = (model_head - ref_head.T).abs().max().item()
+        print(f"  🔄 需要转置 | 转置后差异: {diff:.6f}")
+        total_mismatches += 1
+    else:
+        print(f"  ❌ 形状不匹配")
+        total_mismatches += 1
+    
+    # 5. 总结
+    print("\n" + "=" * 80)
+    print("📊 调试总结")
+    print("=" * 80)
+    if total_mismatches == 0:
+        print("✅ 所有权重形状匹配！")
+        print("   如果输出仍然不对，检查:")
+        print("   - RoPE是否生效")
+        print("   - 因果掩码是否正确")
+        print("   - forward是否传递了token_positions")
+    else:
+        print(f"❌ 发现 {total_mismatches} 处形状不匹配")
+        print("   需要根据上述 🔄 标记添加 .T 转置")
+    
+    print("\n" + "=" * 80)
 
 def run_transformer_lm(
     vocab_size: int,
@@ -402,7 +679,72 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_model = model.TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        theta=rope_theta
+    )
+    
+    state_dict = {}
+    
+    # Token Embedding
+    state_dict['token_embedding.weight'] = weights['token_embeddings.weight']
+    
+    # Transformer Block
+    for layer_idx in range(num_layers):
+        prefix = f'layers.{layer_idx}'
+        
+        # attention
+        state_dict[f'layers.{layer_idx}.attention.W_q.weight'] = weights[f'{prefix}.attn.q_proj.weight']
+        state_dict[f'layers.{layer_idx}.attention.W_k.weight'] = weights[f'{prefix}.attn.k_proj.weight']
+        state_dict[f'layers.{layer_idx}.attention.W_v.weight'] = weights[f'{prefix}.attn.v_proj.weight']
+        state_dict[f'layers.{layer_idx}.attention.W_o.weight'] = weights[f'{prefix}.attn.output_proj.weight']
+        
+        # FFN
+        w1_weight = weights[f'{prefix}.ffn.w1.weight']  # (d_ff, d_model)
+        state_dict[f'layers.{layer_idx}.ffn.w1.weight'] = w1_weight  # 转置成 (d_model, d_ff)
+        
+        w2_weight = weights[f'{prefix}.ffn.w2.weight']  # (d_model, d_ff)
+        state_dict[f'layers.{layer_idx}.ffn.w2.weight'] = w2_weight  # 转置成 (d_ff, d_model)
+        
+        w3_weight = weights[f'{prefix}.ffn.w3.weight']  # (d_ff, d_model)
+        state_dict[f'layers.{layer_idx}.ffn.w3.weight'] = w3_weight  # 转置成 (d_model, d_ff)
+        
+        # RMSNorm
+        state_dict[f'layers.{layer_idx}.norm1.weight'] = weights[f'{prefix}.ln1.weight']
+        state_dict[f'layers.{layer_idx}.norm2.weight'] = weights[f'{prefix}.ln2.weight']
+    
+    state_dict['final_norm.weight'] = weights['ln_final.weight']
+
+    lm_head_weight = weights['lm_head.weight']
+    state_dict['lm_head.weight'] = lm_head_weight
+    
+    # 加载权重
+    transformer_model.load_state_dict(state_dict, strict=False)
+    # debug_transformer_weights(transformer_model, weights, num_layers) # DEBUG2
+    
+    # DEBUG1: 对比state_dict和named_parameters
+    # for name, _ in transformer_model.named_parameters():
+    #     if name in state_dict:
+    #         print(f"✅ {name}")
+    #     else:
+    #         print(f"❌ {name} 不在state_dict中")
+
+    # 生成位置索引
+    batch_size, seq_len = in_indices.shape
+    device = in_indices.device
+    token_positions = torch.arange(seq_len, device=device)
+    token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+    
+    # 前向传播
+    with torch.no_grad():
+        logits = transformer_model(in_indices, token_positions)
+    
+    return logits
 
 
 def run_rmsnorm(

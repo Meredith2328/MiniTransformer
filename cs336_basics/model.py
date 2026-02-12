@@ -126,8 +126,11 @@ class SwiGLU(nn.Module):
         self.w3 = Linear(d_model, d_ff, device, dtype)
 
     def forward(self, x):
+        orig_dtype = x.dtype
+        x = x.float()
         silu = SiLU()
-        return self.w2((silu(self.w1(x)) * self.w3(x)))
+        output = self.w2((silu(self.w1(x)) * self.w3(x)))
+        return output.to(orig_dtype)
 
 class RoPE(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
@@ -224,10 +227,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.use_rope = use_rope
         
         # 线性投影层（无偏置）
-        self.W_q = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
-        self.W_k = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
-        self.W_v = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
-        self.W_o = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
+        self.W_q = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_k = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_v = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_o = Linear(d_model, d_model, device=device, dtype=dtype)
         
         # RoPE（如果需要）
         if use_rope:
@@ -305,3 +308,114 @@ class MultiHeadSelfAttention(nn.Module):
         output = self.W_o(attn_output)
         
         return output
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float = 10000.0,
+        max_seq_len: int = 2048,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        
+        self.norm1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.attention = MultiHeadSelfAttention(
+            d_model, num_heads, True, theta, max_seq_len, device, dtype
+        )
+        
+        self.norm2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+    
+    def forward(self, x, token_positions=None):
+        x = x + self.attention(self.norm1(x), token_positions)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+class TransformerLM(nn.Module):
+    """
+    Transformer Language Model
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        num_layers: int,
+        theta: float = 10000.0,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.theta = theta
+        
+        # Token Embedding
+        self.token_embedding = Embedding(
+            vocab_size, 
+            d_model, 
+            device=device, 
+            dtype=dtype
+        )
+        
+        # Transformer Blocks - 注意变量名改为layers以匹配adapter
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                theta=theta,
+                max_seq_len=context_length,
+                device=device,
+                dtype=dtype
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # Final Layer Norm
+        self.final_norm = RMSNorm(
+            d_model, 
+            device=device, 
+            dtype=dtype
+        )
+        
+        # Output Projection (权重绑定)
+        self.lm_head = Linear(
+            d_model, 
+            vocab_size, 
+            device=device, 
+            dtype=dtype
+        )
+        
+        # 罪魁祸首, 不应该用权重绑定!
+        # self.lm_head.weight = self.token_embedding.weight
+    
+    def forward(
+        self,
+        token_ids: Int[Tensor, "batch seq_len"],
+        token_positions: Int[Tensor, "batch seq_len"] | None = None
+    ) -> Float[Tensor, "batch seq_len vocab_size"]:
+        """
+        前向传播
+        """
+        x = self.token_embedding(token_ids)  # [batch, seq_len, d_model]
+        
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        
+        x = self.final_norm(x)
+        logits = self.lm_head(x)  # [batch, seq_len, vocab_size]
+        
+        return logits
+        
