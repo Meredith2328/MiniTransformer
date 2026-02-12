@@ -83,8 +83,7 @@ class Embedding(nn.Module):
 
 class RMSNorm(nn.Module):
     """RMSNorm(a_i) = a_i * g_i / RMS(a)
-    RMS(a) = \sqrt(\sum_{i=1}^{d_model} a_i^2 + eps)
-    which is the std without "-avg" step.
+    RMS(a) is the std without "-avg" step.
     g_i: (d_model) is a learnable "gain" parameter.
     eps: 1e-5. Hyperparameter.
     """
@@ -139,6 +138,7 @@ class RoPE(nn.Module):
         self.max_seq_len = max_seq_len
 
         # precalc frequencies
+        # freqs[k] = Θ^(-2k/d_k) for 2k = 0, 2, ..., d_k - 2
         freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device).float() / d_k))
         positions = torch.arange(max_seq_len, device=device).float()
 
@@ -172,3 +172,31 @@ class RoPE(nn.Module):
             two=2
         )
         return x_rotated.to(orig_dtype)
+
+class Softmax(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, dim):
+        '''Numerical stability trick:
+        softmax(x) = softmax(x - max(x))
+        since
+        exp(x_i) / Σexp(x_j) = exp(x_i - c) / Σexp(x_j - c)'''
+        x -= x.max(dim=dim, keepdim=True)[0] # [0] for max val, [1] for index
+        return torch.exp(x) / (torch.exp(x).sum(dim=dim, keepdim=True))
+
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q, K, V, mask):
+        d_k = Q.shape[-1]
+        scores = einsum(Q, K, '... q d_k, ... k d_k -> ... q k') / (d_k ** 0.5)
+        if mask is not None: # [seq_len, seq_len]
+            while mask.dim() < scores.dim():
+                mask = mask.unsqueeze(0)
+            scores = scores.masked_fill(~mask, float('-inf'))
+        softmax = Softmax()
+        attn_weights = softmax(scores, dim=-1)
+        return einsum(attn_weights, V, '... q k, ... k d -> ... q d')
+    
