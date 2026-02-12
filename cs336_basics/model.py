@@ -3,7 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 from math import sqrt
-from einops import einsum
+from einops import einsum, rearrange
 from jaxtyping import Float, Integer
 
 class Linear(nn.Module):
@@ -84,6 +84,7 @@ class Embedding(nn.Module):
 class RMSNorm(nn.Module):
     """RMSNorm(a_i) = a_i * g_i / RMS(a)
     RMS(a) = \sqrt(\sum_{i=1}^{d_model} a_i^2 + eps)
+    which is the std without "-avg" step.
     g_i: (d_model) is a learnable "gain" parameter.
     eps: 1e-5. Hyperparameter.
     """
@@ -128,3 +129,46 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         silu = SiLU()
         return self.w2((silu(self.w1(x)) * self.w3(x)))
+
+class RoPE(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        assert d_k % 2 == 0
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+
+        # precalc frequencies
+        freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device).float() / d_k))
+        positions = torch.arange(max_seq_len, device=device).float()
+
+        # Cartesian product
+        angles = einsum(positions, freqs, 'seq, half -> seq half')
+
+        self.register_buffer('cos', torch.cos(angles), persistent=False)
+        self.register_buffer('sin', torch.sin(angles), persistent=False)
+        
+    def forward(self, x, token_positions):
+        orig_dtype = x.dtype
+        device = x.device
+
+        if self.cos.device != device:
+            self.cos = self.cos.to(device)
+            self.sin = self.sin.to(device)
+
+        x_reshaped = rearrange(x, '... seq (half two) -> ... seq half two', two=2)
+
+        positions = token_positions.long()
+        cos = self.cos[positions]
+        sin = self.sin[positions]
+
+        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
+        rotated_x1 = x1 * cos - x2 * sin
+        rotated_x2 = x1 * sin + x2 * cos
+
+        x_rotated = rearrange(
+            [rotated_x1, rotated_x2],
+            'two ... seq half -> ... seq (half two)',
+            two=2
+        )
+        return x_rotated.to(orig_dtype)

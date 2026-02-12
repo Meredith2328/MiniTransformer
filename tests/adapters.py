@@ -207,7 +207,10 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = model.RoPE(theta, d_k, max_seq_len)
+    with torch.no_grad():
+        output = rope(in_query_or_key, token_positions)
+    return output
 
 
 def run_transformer_block(
