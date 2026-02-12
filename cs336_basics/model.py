@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn.init import trunc_normal_
 from math import sqrt
 from einops import einsum, rearrange
-from jaxtyping import Float, Integer
+from jaxtyping import Float, Integer, Int
 
 class Linear(nn.Module):
     '''Construct a (out_features, in_features) linear layer.
@@ -200,3 +200,108 @@ class ScaledDotProductAttention(nn.Module):
         attn_weights = softmax(scores, dim=-1)
         return einsum(attn_weights, V, '... q k, ... k d -> ... q d')
     
+class MultiHeadSelfAttention(nn.Module):
+    """
+    MHA. Use RoPE or not.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        use_rope: bool = False,
+        theta: float = 10000.0,
+        max_seq_len: int = 2048,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.use_rope = use_rope
+        
+        # 线性投影层（无偏置）
+        self.W_q = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
+        self.W_k = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
+        self.W_v = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
+        self.W_o = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
+        
+        # RoPE（如果需要）
+        if use_rope:
+            self.rope = RoPE(
+                theta=theta,
+                d_k=self.d_k,
+                max_seq_len=max_seq_len,
+                device=device
+            )
+        
+        # 因果掩码
+        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).bool()
+        self.register_buffer('causal_mask', causal_mask, persistent=False)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in [self.W_q, self.W_k, self.W_v, self.W_o]:
+            std = (2.0 / (module.in_features + module.out_features)) ** 0.5
+            trunc_normal_(
+                module.weight,
+                mean=0.0,
+                std=std,
+                a=-3 * std,
+                b=3 * std
+            )
+    
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],
+        token_positions: Int[Tensor, "... seq_len"] | None = None
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """
+        前向传播
+        """
+        device = x.device
+        seq_len = x.shape[-2]
+        
+        # 1. Q/K/V投影
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+        
+        # 2. 多头拆分
+        q = rearrange(q, '... s (h d) -> ... h s d', h=self.num_heads)
+        k = rearrange(k, '... s (h d) -> ... h s d', h=self.num_heads)
+        v = rearrange(v, '... s (h d) -> ... h s d', h=self.num_heads)
+        
+        # 3. RoPE（如果需要）
+        if self.use_rope:
+            if token_positions is None:
+                # 自动生成位置索引
+                batch_shape = x.shape[:-2]
+                token_positions = torch.arange(seq_len, device=device)
+                token_positions = token_positions.expand(*batch_shape, -1)
+            
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+            # V不应用RoPE
+        
+        # 4. 缩放点积注意力 + 因果掩码
+        scale = self.d_k ** 0.5
+        scores = einsum(q, k, '... h q d, ... h k d -> ... h q k') / scale
+        
+        mask = self.causal_mask[:seq_len, :seq_len]
+        scores = scores.masked_fill(~mask, float('-inf'))
+        
+        attn_weights = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
+        attn_output = einsum(attn_weights, v, '... h q k, ... h k d -> ... h q d')
+        
+        # 5. 多头合并
+        attn_output = rearrange(attn_output, '... h s d -> ... s (h d)')
+        
+        # 6. 输出投影
+        output = self.W_o(attn_output)
+        
+        return output
