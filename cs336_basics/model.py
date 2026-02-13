@@ -3,7 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 from math import sqrt
-from einops import einsum, rearrange
+from einops import einsum, rearrange, reduce
 from jaxtyping import Float, Integer, Int
 
 class Linear(nn.Module):
@@ -419,3 +419,35 @@ class TransformerLM(nn.Module):
         
         return logits
         
+class CrossEntropyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, inputs, targets):
+        # 1) calc log-sum-exp
+        # batch "1" since 1 only automatically added in the front
+        max_vals = reduce(inputs, 'batch vocab -> batch 1', reduction='max')
+        inputs_stable = inputs - max_vals # (batch, vocab)
+        
+        log_sum_exp = reduce(
+            inputs_stable.exp(),
+            'batch vocab -> batch',
+            reduction='sum'
+        ).log() + max_vals
+        
+        # 2) get the predicted vals for correct labels
+        # eg. targets = torch.tensor([2, 0, 3])
+        # logits = torch.tensor([
+        #     [0.1, 0.2, '0.3', 0.4, 0.5],
+        #     ['1.0', 1.1, 1.2, 1.3, 1.4],
+        #     [2.0, 2.1, 2.2, '2.3', 2.4]
+        # ])
+        # we take torch.tensor([0.3, 1.0, 2.3])
+        target_logits = inputs.gather(
+            dim=-1,
+            index=targets.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # 3) calc batch mean loss
+        losses = log_sum_exp - target_logits
+        return losses.mean()
