@@ -166,6 +166,9 @@ class RoPE(nn.Module):
         x_reshaped = rearrange(x, '... seq (half two) -> ... seq half two', two=2)
 
         positions = token_positions.long()
+        # Make positions broadcastable to attention tensors that include a head axis.
+        while positions.dim() < (x.dim() - 1):
+            positions = positions.unsqueeze(-2)
         cos = self.cos[positions]
         sin = self.sin[positions]
 

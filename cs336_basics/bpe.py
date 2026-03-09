@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 import json
-from typing import BinaryIO
+import time
+from typing import Any, BinaryIO, Callable
 import os
 
 import regex as re
@@ -49,15 +50,73 @@ class ByteLevelBPE:
         input_path: str,
         vocab_size: int,
         special_tokens: list[str],
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        progress_every: int = 100,
     ) -> tuple[dict[int, bytes], list[Pair]]:
+        def emit(event: dict[str, Any]) -> None:
+            if progress_callback is not None:
+                progress_callback(event)
+
+        total_start = time.perf_counter()
         self._special_tokens = list(special_tokens)
 
+        emit(
+            {
+                "stage": "read_corpus",
+                "event": "start",
+                "input_path": input_path,
+            }
+        )
+        read_start = time.perf_counter()
         with open(input_path, "r", encoding="utf-8") as f:
             text = f.read()
+        emit(
+            {
+                "stage": "read_corpus",
+                "event": "end",
+                "seconds": time.perf_counter() - read_start,
+                "num_chars": len(text),
+            }
+        )
 
+        emit({"stage": "pretokenize", "event": "start"})
+        pretoken_start = time.perf_counter()
         word_freq = self._pretokenize_and_count(text)
+        emit(
+            {
+                "stage": "pretokenize",
+                "event": "end",
+                "seconds": time.perf_counter() - pretoken_start,
+                "num_unique_words": len(word_freq),
+                "num_word_instances": int(sum(word_freq.values())),
+            }
+        )
+
+        emit({"stage": "init_vocab", "event": "start"})
         self._init_vocab(special_tokens)
-        self._learn_merges(word_freq, vocab_size)
+        emit(
+            {
+                "stage": "init_vocab",
+                "event": "end",
+                "initial_vocab_size": len(self.vocab),
+            }
+        )
+
+        merges_done = self._learn_merges(
+            word_freq,
+            vocab_size,
+            progress_callback=progress_callback,
+            progress_every=progress_every,
+        )
+        emit(
+            {
+                "stage": "train",
+                "event": "end",
+                "seconds": time.perf_counter() - total_start,
+                "num_merges": merges_done,
+                "final_vocab_size": len(self.vocab),
+            }
+        )
         return self.vocab, self.merges
 
     def encode(self, text: str) -> list[int]:
@@ -144,11 +203,33 @@ class ByteLevelBPE:
         for i in range(256):
             self.vocab[start + i] = self._single_byte_tokens[i]
 
-    def _learn_merges(self, word_freq: dict[Word, int], target_vocab_size: int) -> None:
+    def _learn_merges(
+        self,
+        word_freq: dict[Word, int],
+        target_vocab_size: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        progress_every: int = 100,
+    ) -> int:
+        def emit(event: dict[str, Any]) -> None:
+            if progress_callback is not None:
+                progress_callback(event)
+
         remaining = max(0, target_vocab_size - len(self.vocab))
         pair_freq, pair_to_words = self._build_pair_stats(word_freq)
+        progress_every = max(1, int(progress_every))
+        merge_start = time.perf_counter()
+        merges_done = 0
 
-        for _ in range(remaining):
+        emit(
+            {
+                "stage": "learn_merges",
+                "event": "start",
+                "target_merges": remaining,
+                "starting_vocab_size": len(self.vocab),
+            }
+        )
+
+        for merge_idx in range(remaining):
             if not pair_freq:
                 break
 
@@ -159,9 +240,40 @@ class ByteLevelBPE:
             self.merges.append(best_pair)
             self.vocab[len(self.vocab)] = best_pair[0] + best_pair[1]
             self._apply_merge(best_pair, word_freq, pair_freq, pair_to_words)
+            merges_done = merge_idx + 1
 
             pair_freq.pop(best_pair, None)
             pair_to_words.pop(best_pair, None)
+
+            if merges_done == 1 or merges_done % progress_every == 0 or merges_done == remaining:
+                elapsed = time.perf_counter() - merge_start
+                merge_rate = merges_done / elapsed if elapsed > 0 else 0.0
+                pending = max(0, remaining - merges_done)
+                eta_seconds = pending / merge_rate if merge_rate > 0 else None
+                emit(
+                    {
+                        "stage": "learn_merges",
+                        "event": "progress",
+                        "completed_merges": merges_done,
+                        "target_merges": remaining,
+                        "progress": (merges_done / remaining) if remaining > 0 else 1.0,
+                        "merge_rate_per_sec": merge_rate,
+                        "eta_seconds": eta_seconds,
+                        "current_pair_count": best_count,
+                    }
+                )
+
+        emit(
+            {
+                "stage": "learn_merges",
+                "event": "end",
+                "completed_merges": merges_done,
+                "target_merges": remaining,
+                "seconds": time.perf_counter() - merge_start,
+                "final_vocab_size": len(self.vocab),
+            }
+        )
+        return merges_done
 
     def _build_pair_stats(
         self,

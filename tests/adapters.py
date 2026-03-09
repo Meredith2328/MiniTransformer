@@ -986,4 +986,4 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     tokenizer = bpe.ByteLevelBPE()
-    return tokenizer.train(input_path, vocab_size, special_tokens)
+    return tokenizer.train(input_path, vocab_size, special_tokens, **kwargs)
