@@ -1,40 +1,163 @@
-import os
-import sys
-import time
-import math
+from __future__ import annotations
+
 import argparse
+import json
+import time
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from typing import Optional, Tuple, Dict, Any
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import AdamW as TorchAdamW
 
-# 导入你的模型实现
-from model import TransformerLM
-from utils import get_batch, get_lr_cosine_schedule, save_checkpoint, load_checkpoint
+from cs336_basics.model import AdamW as CustomAdamW
+from cs336_basics.model import TransformerLM
+from cs336_basics.utils import (
+    get_batch,
+    get_lr_cosine_schedule,
+    gradient_clipping,
+    load_checkpoint,
+    save_checkpoint,
+)
 
-'''
-# 训练GPT-2 small
-python train.py \
-    --train-data ./data/train.bin \
-    --val-data ./data/val.bin \
-    --vocab-size 50257 \
-    --d-model 768 \
-    --num-heads 12 \
-    --d-ff 3072 \
-    --num-layers 12 \
-    --context-length 1024 \
-    --learning-rate 6e-4 \
-    --batch-size 32 \
-    --total-iters 100000 \
-    --save-dir ./checkpoints/gpt2-small
 
-# 从检查点恢复
-python train.py \
-    --train-data ./data/train.bin \
-    --resume ./checkpoints/gpt2-small/checkpoint_0050000.pt \
-    # ... 其他参数
-'''
+NP_DTYPES: dict[str, np.dtype[Any]] = {
+    "uint16": np.dtype(np.uint16),
+    "uint32": np.dtype(np.uint32),
+    "int32": np.dtype(np.int32),
+    "int64": np.dtype(np.int64),
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train TransformerLM on tokenized binary data.")
+
+    # Data
+    parser.add_argument("--train-data", type=str, required=True, help="Path to training .bin file.")
+    parser.add_argument("--val-data", type=str, default=None, help="Optional path to validation .bin file.")
+    parser.add_argument(
+        "--data-dtype",
+        type=str,
+        default="uint16",
+        choices=sorted(NP_DTYPES.keys()),
+        help="Token dtype used in train/val .bin files.",
+    )
+
+    # Model
+    parser.add_argument("--vocab-size", type=int, required=True, help="Vocabulary size.")
+    parser.add_argument("--context-length", type=int, default=1024, help="Maximum context length.")
+    parser.add_argument("--d-model", type=int, default=768, help="Model hidden size.")
+    parser.add_argument("--num-heads", type=int, default=12, help="Number of attention heads.")
+    parser.add_argument("--d-ff", type=int, default=3072, help="Feedforward hidden size.")
+    parser.add_argument("--num-layers", type=int, default=12, help="Number of transformer blocks.")
+    parser.add_argument("--rope-theta", type=float, default=10000.0, help="RoPE theta parameter.")
+
+    # Optimizer + schedule
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="custom_adamw",
+        choices=["custom_adamw", "torch_adamw"],
+        help="Optimizer implementation.",
+    )
+    parser.add_argument("--learning-rate", type=float, default=6e-4, help="Peak learning rate.")
+    parser.add_argument("--min-learning-rate", type=float, default=6e-5, help="Final learning rate.")
+    parser.add_argument("--warmup-iters", type=int, default=2000, help="Linear warmup iterations.")
+    parser.add_argument("--total-iters", type=int, default=100000, help="Total training iterations.")
+    parser.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1.")
+    parser.add_argument("--beta2", type=float, default=0.95, help="AdamW beta2.")
+    parser.add_argument("--eps", type=float, default=1e-8, help="AdamW epsilon.")
+    parser.add_argument("--weight-decay", type=float, default=0.1, help="AdamW weight decay.")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Global grad clip max L2 norm.")
+
+    # Training loop
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--device", type=str, default="auto", help="Device: auto/cpu/cuda/cuda:0/mps.")
+    parser.add_argument("--seed", type=int, default=1337, help="Random seed.")
+
+    # Logging / eval / checkpoints
+    parser.add_argument("--log-interval", type=int, default=50, help="Log every N iterations.")
+    parser.add_argument("--eval-interval", type=int, default=500, help="Run validation every N iterations.")
+    parser.add_argument("--eval-iters", type=int, default=50, help="Validation minibatches per evaluation.")
+    parser.add_argument("--save-interval", type=int, default=1000, help="Save checkpoint every N iterations.")
+    parser.add_argument("--save-dir", type=str, default="checkpoints", help="Checkpoint output directory.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from.")
+
+    # Optional W&B
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb-project", type=str, default="cs336-assignment1", help="W&B project.")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name.")
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B mode.",
+    )
+
+    args = parser.parse_args()
+    validate_args(args)
+    return args
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.total_iters <= 0:
+        raise ValueError("--total-iters must be positive.")
+    if args.warmup_iters < 0:
+        raise ValueError("--warmup-iters must be >= 0.")
+    if args.warmup_iters >= args.total_iters:
+        raise ValueError("--warmup-iters must be < --total-iters to avoid degenerate schedule.")
+    if args.context_length <= 0:
+        raise ValueError("--context-length must be positive.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if args.log_interval <= 0 or args.eval_interval <= 0 or args.eval_iters <= 0 or args.save_interval <= 0:
+        raise ValueError("--log/eval/save intervals must all be positive.")
+    if args.vocab_size <= 0:
+        raise ValueError("--vocab-size must be positive.")
+    if args.d_model <= 0 or args.d_ff <= 0 or args.num_layers <= 0 or args.num_heads <= 0:
+        raise ValueError("--d-model/--d-ff/--num-layers/--num-heads must be positive.")
+    if args.d_model % args.num_heads != 0:
+        raise ValueError("--d-model must be divisible by --num-heads.")
+
+
+def resolve_device(device_arg: str) -> str:
+    if device_arg != "auto":
+        return device_arg
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_memmap_dataset(path: str, dtype_name: str, context_length: int) -> np.memmap:
+    dtype = NP_DTYPES[dtype_name]
+    dataset = np.memmap(path, dtype=dtype, mode="r")
+    if dataset.ndim != 1:
+        dataset = dataset.reshape(-1)
+    if dataset.shape[0] < context_length + 1:
+        raise ValueError(
+            f"Dataset {path} has {dataset.shape[0]} tokens, but needs at least context_length+1={context_length + 1}."
+        )
+    return dataset
+
+
+def build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.Optimizer:
+    kwargs = dict(
+        lr=args.learning_rate,
+        betas=(args.beta1, args.beta2),
+        eps=args.eps,
+        weight_decay=args.weight_decay,
+    )
+    if args.optimizer == "torch_adamw":
+        return TorchAdamW(model.parameters(), **kwargs)
+    return CustomAdamW(model.parameters(), **kwargs)
+
 
 def estimate_loss(
     model: nn.Module,
@@ -42,313 +165,198 @@ def estimate_loss(
     batch_size: int,
     context_length: int,
     eval_iters: int,
-    device: str
+    device: str,
 ) -> float:
-    """
-    评估模型损失（无梯度）
-    """
+    was_training = model.training
     model.eval()
-    total_loss = 0.0
-    
-    with torch.no_grad():
+    losses: list[float] = []
+    with torch.inference_mode():
         for _ in range(eval_iters):
             inputs, targets = get_batch(dataset, batch_size, context_length, device)
-            logits = model(inputs)  # [batch, seq_len, vocab_size]
-            
-            # 计算损失
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
-            total_loss += loss.item()
-    
-    model.train()
-    return total_loss / eval_iters
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            losses.append(float(loss.item()))
+    if was_training:
+        model.train()
+    return float(np.mean(losses))
 
 
-def train(
-    # 数据参数
-    train_data_path: str,
-    val_data_path: Optional[str],
-    # 模型参数
-    vocab_size: int,
-    d_model: int,
-    num_heads: int,
-    d_ff: int,
-    num_layers: int,
-    context_length: int,
-    # 优化器参数
-    learning_rate: float,
-    min_learning_rate: float,
-    warmup_iters: int,
-    total_iters: int,
-    beta1: float,
-    beta2: float,
-    eps: float,
-    weight_decay: float,
-    # 训练参数
-    batch_size: int,
-    eval_interval: int,
-    eval_iters: int,
-    log_interval: int,
-    save_interval: int,
-    save_dir: str,
-    device: str,
-    resume_checkpoint: Optional[str] = None,
-):
-    """
-    主训练循环
-    """
-    # 创建保存目录
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 加载数据集（内存映射）
-    print(f"加载训练数据: {train_data_path}")
-    train_dataset = np.memmap(train_data_path, dtype=np.uint16, mode='r')
-    
-    if val_data_path:
-        print(f"加载验证数据: {val_data_path}")
-        val_dataset = np.memmap(val_data_path, dtype=np.uint16, mode='r')
-    else:
-        val_dataset = None
-    
-    # 创建模型
+def maybe_init_wandb(args: argparse.Namespace, run_config: dict[str, Any], run_dir: Path):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("`--wandb` was set, but `wandb` is not installed in the current environment.") from exc
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        config=run_config,
+        dir=str(run_dir),
+    )
+
+
+def train(args: argparse.Namespace) -> None:
+    device = resolve_device(args.device)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(args.seed)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading train data from: {args.train_data}")
+    train_dataset = load_memmap_dataset(args.train_data, args.data_dtype, args.context_length)
+    val_dataset = None
+    if args.val_data:
+        print(f"Loading val data from: {args.val_data}")
+        val_dataset = load_memmap_dataset(args.val_data, args.data_dtype, args.context_length)
+
     model = TransformerLM(
-        vocab_size=vocab_size,
-        context_length=context_length,
-        d_model=d_model,
-        num_heads=num_heads,
-        d_ff=d_ff,
-        num_layers=num_layers,
-        theta=10000.0,  # RoPE参数
-    ).to(device)
-    
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    
-    # 创建优化器
-    optimizer = AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        betas=(beta1, beta2),
-        eps=eps,
-        weight_decay=weight_decay
-    )
-    
-    # 恢复检查点
-    start_iter = 0
-    if resume_checkpoint and os.path.exists(resume_checkpoint):
-        print(f"恢复检查点: {resume_checkpoint}")
-        start_iter, _ = load_checkpoint(resume_checkpoint, model, optimizer, device)
-        print(f"从步数 {start_iter} 恢复训练")
-    
-    # 训练循环
-    print("\n开始训练...")
-    print("=" * 80)
-    
-    train_losses = []
-    iter_time = 0.0
-    best_val_loss = float('inf')
-    
-    for iter_num in range(start_iter, total_iters):
-        iter_start = time.time()
-        
-        # 1. 调整学习率
-        lr = get_lr_cosine_schedule(
-            iter_num,
-            learning_rate,
-            min_learning_rate,
-            warmup_iters,
-            total_iters
-        )
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        # 2. 采样batch
-        inputs, targets = get_batch(train_dataset, batch_size, context_length, device)
-        
-        # 3. 前向传播
-        logits = model(inputs)
-        loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1)
-        )
-        
-        # 4. 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # 5. 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # 6. 优化器步进
-        optimizer.step()
-        
-        # 计时
-        iter_time += time.time() - iter_start
-        
-        # 记录训练损失
-        train_losses.append(loss.item())
-        
-        # 日志
-        if iter_num % log_interval == 0:
-            avg_loss = np.mean(train_losses[-log_interval:])
-            print(f"步数 {iter_num:6d} | 损失 {avg_loss:.4f} | 学习率 {lr:.2e} | 时间 {iter_time:.2f}s")
-            iter_time = 0.0
-        
-        # 评估
-        if iter_num % eval_interval == 0 and val_dataset is not None:
-            val_loss = estimate_loss(
-                model, val_dataset, batch_size, context_length,
-                eval_iters, device
-            )
-            print(f"步数 {iter_num:6d} | 验证损失 {val_loss:.4f}")
-            
-            # 保存最佳模型
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path = os.path.join(save_dir, f'best_model.pt')
-                save_checkpoint(
-                    model, optimizer, iter_num, best_path,
-                    config={
-                        'vocab_size': vocab_size,
-                        'd_model': d_model,
-                        'num_heads': num_heads,
-                        'd_ff': d_ff,
-                        'num_layers': num_layers,
-                        'context_length': context_length
-                    },
-                    val_loss=val_loss
-                )
-        
-        # 定期保存检查点
-        if iter_num % save_interval == 0 and iter_num > 0:
-            checkpoint_path = os.path.join(save_dir, f'checkpoint_{iter_num:07d}.pt')
-            save_checkpoint(
-                model, optimizer, iter_num, checkpoint_path,
-                config={
-                    'vocab_size': vocab_size,
-                    'd_model': d_model,
-                    'num_heads': num_heads,
-                    'd_ff': d_ff,
-                    'num_layers': num_layers,
-                    'context_length': context_length
-                }
-            )
-    
-    print("\n训练完成!")
-    print("=" * 80)
-    
-    # 保存最终模型
-    final_path = os.path.join(save_dir, 'final_model.pt')
-    save_checkpoint(
-        model, optimizer, total_iters, final_path,
-        config={
-            'vocab_size': vocab_size,
-            'd_model': d_model,
-            'num_heads': num_heads,
-            'd_ff': d_ff,
-            'num_layers': num_layers,
-            'context_length': context_length
-        }
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(description='训练Transformer语言模型')
-    
-    # 数据参数
-    parser.add_argument('--train-data', type=str, required=True,
-                        help='训练数据路径 (numpy memmap)')
-    parser.add_argument('--val-data', type=str, default=None,
-                        help='验证数据路径 (numpy memmap)')
-    
-    # 模型参数
-    parser.add_argument('--vocab-size', type=int, default=50257,
-                        help='词表大小')
-    parser.add_argument('--d-model', type=int, default=768,
-                        help='模型维度')
-    parser.add_argument('--num-heads', type=int, default=12,
-                        help='注意力头数')
-    parser.add_argument('--d-ff', type=int, default=3072,
-                        help='FFN内部维度')
-    parser.add_argument('--num-layers', type=int, default=12,
-                        help='Transformer层数')
-    parser.add_argument('--context-length', type=int, default=1024,
-                        help='上下文长度')
-    
-    # 优化器参数
-    parser.add_argument('--learning-rate', type=float, default=6e-4,
-                        help='最大学习率')
-    parser.add_argument('--min-learning-rate', type=float, default=6e-5,
-                        help='最小学习率')
-    parser.add_argument('--warmup-iters', type=int, default=2000,
-                        help='预热步数')
-    parser.add_argument('--total-iters', type=int, default=100000,
-                        help='总训练步数')
-    parser.add_argument('--beta1', type=float, default=0.9,
-                        help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.95,
-                        help='Adam beta2')
-    parser.add_argument('--eps', type=float, default=1e-8,
-                        help='Adam epsilon')
-    parser.add_argument('--weight-decay', type=float, default=0.1,
-                        help='权重衰减')
-    
-    # 训练参数
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='批次大小')
-    parser.add_argument('--eval-interval', type=int, default=1000,
-                        help='评估间隔')
-    parser.add_argument('--eval-iters', type=int, default=200,
-                        help='评估迭代次数')
-    parser.add_argument('--log-interval', type=int, default=100,
-                        help='日志间隔')
-    parser.add_argument('--save-interval', type=int, default=5000,
-                        help='保存间隔')
-    parser.add_argument('--save-dir', type=str, default='./checkpoints',
-                        help='保存目录')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='设备')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='恢复训练的检查点路径')
-    
-    args = parser.parse_args()
-    
-    # 打印配置
-    print("=" * 80)
-    print("训练配置:")
-    for key, value in vars(args).items():
-        print(f"  {key}: {value}")
-    print("=" * 80)
-    
-    # 开始训练
-    train(
-        train_data_path=args.train_data,
-        val_data_path=args.val_data,
         vocab_size=args.vocab_size,
+        context_length=args.context_length,
         d_model=args.d_model,
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         num_layers=args.num_layers,
-        context_length=args.context_length,
-        learning_rate=args.learning_rate,
-        min_learning_rate=args.min_learning_rate,
-        warmup_iters=args.warmup_iters,
-        total_iters=args.total_iters,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        eps=args.eps,
-        weight_decay=args.weight_decay,
-        batch_size=args.batch_size,
-        eval_interval=args.eval_interval,
-        eval_iters=args.eval_iters,
-        log_interval=args.log_interval,
-        save_interval=args.save_interval,
-        save_dir=args.save_dir,
-        device=args.device,
-        resume_checkpoint=args.resume
-    )
+        theta=args.rope_theta,
+    ).to(device)
+    optimizer = build_optimizer(args, model)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Device: {device}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    start_step = 1
+    if args.resume:
+        resumed_iter = load_checkpoint(args.resume, model, optimizer)
+        start_step = int(resumed_iter) + 1
+        print(f"Resumed from checkpoint {args.resume}, continuing at step {start_step}.")
+
+    run_config = vars(args).copy()
+    run_config["resolved_device"] = device
+    with (save_dir / "run_config.json").open("w", encoding="utf-8") as f:
+        json.dump(run_config, f, indent=2, ensure_ascii=False)
+
+    wandb_run = maybe_init_wandb(args, run_config, save_dir)
+
+    model.train()
+    best_val_loss = float("inf")
+    best_step = 0
+    last_completed_step = start_step - 1
+
+    window_losses: list[float] = []
+    tokens_since_log = 0
+    last_log_time = time.perf_counter()
+    train_start_time = time.perf_counter()
+
+    print("Starting training...")
+    try:
+        for step in range(start_step, args.total_iters + 1):
+            lr = get_lr_cosine_schedule(
+                step,
+                args.learning_rate,
+                args.min_learning_rate,
+                args.warmup_iters,
+                args.total_iters,
+            )
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            inputs, targets = get_batch(train_dataset, args.batch_size, args.context_length, device)
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+
+            if args.grad_clip > 0:
+                gradient_clipping(model.parameters(), max_l2_norm=args.grad_clip)
+
+            optimizer.step()
+
+            loss_value = float(loss.item())
+            window_losses.append(loss_value)
+            last_completed_step = step
+            tokens_since_log += args.batch_size * args.context_length
+
+            if step % args.log_interval == 0:
+                now = time.perf_counter()
+                elapsed = max(now - last_log_time, 1e-8)
+                avg_train_loss = float(np.mean(window_losses[-args.log_interval :]))
+                tokens_per_second = tokens_since_log / elapsed
+                print(
+                    f"step {step:7d} | train_loss {avg_train_loss:.4f} | "
+                    f"lr {lr:.3e} | tok/s {tokens_per_second:,.0f}"
+                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "step": step,
+                            "train/loss": avg_train_loss,
+                            "train/lr": lr,
+                            "train/tokens_per_second": tokens_per_second,
+                        },
+                        step=step,
+                    )
+                last_log_time = now
+                tokens_since_log = 0
+
+            if val_dataset is not None and step % args.eval_interval == 0:
+                val_loss = estimate_loss(
+                    model=model,
+                    dataset=val_dataset,
+                    batch_size=args.batch_size,
+                    context_length=args.context_length,
+                    eval_iters=args.eval_iters,
+                    device=device,
+                )
+                print(f"step {step:7d} | val_loss {val_loss:.4f}")
+                if wandb_run is not None:
+                    wandb_run.log({"step": step, "val/loss": val_loss}, step=step)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_step = step
+                    best_path = save_dir / "best.pt"
+                    save_checkpoint(model, optimizer, step, best_path)
+                    print(f"  saved new best checkpoint to {best_path} (val_loss={val_loss:.4f})")
+
+            if step % args.save_interval == 0:
+                ckpt_path = save_dir / f"step_{step:08d}.pt"
+                save_checkpoint(model, optimizer, step, ckpt_path)
+                save_checkpoint(model, optimizer, step, save_dir / "latest.pt")
+                print(f"  checkpoint saved: {ckpt_path}")
+
+    except KeyboardInterrupt:
+        interrupted_path = save_dir / f"interrupted_step_{last_completed_step:08d}.pt"
+        save_checkpoint(model, optimizer, last_completed_step, interrupted_path)
+        print(f"\nInterrupted. Saved checkpoint to {interrupted_path}")
+        raise
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    final_path = save_dir / "final.pt"
+    save_checkpoint(model, optimizer, last_completed_step, final_path)
+    total_seconds = time.perf_counter() - train_start_time
+    print(f"Training complete in {total_seconds:.1f}s. Final checkpoint: {final_path}")
+    if val_dataset is not None and best_step > 0:
+        print(f"Best validation loss {best_val_loss:.4f} at step {best_step}.")
 
 
-if __name__ == '__main__':
+def main() -> None:
+    args = parse_args()
+    print("Configuration:")
+    for key, value in vars(args).items():
+        print(f"  {key}: {value}")
+    train(args)
+
+
+if __name__ == "__main__":
     main()
