@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
+import json
 from typing import BinaryIO
 import os
 
@@ -239,3 +241,186 @@ class ByteLevelBPE:
                 out.append(word[i])
                 i += 1
         return tuple(out)
+
+
+class Tokenizer:
+    """Byte-level BPE tokenizer runtime."""
+
+    _GPT2_PATTERN = ByteLevelBPE._GPT2_PATTERN
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        self.vocab: dict[int, bytes] = dict(vocab)
+        self.merges: list[tuple[bytes, bytes]] = list(merges)
+        self.special_tokens: list[str] = list(special_tokens or [])
+        self._single_byte_tokens: list[bytes] = [bytes([i]) for i in range(256)]
+
+        self._append_missing_special_tokens()
+        self.token_to_id: dict[bytes, int] = self._build_token_to_id()
+        self.merge_ranks: dict[tuple[bytes, bytes], int] = {
+            pair: rank for rank, pair in enumerate(self.merges)
+        }
+
+        self._token_re = re.compile(self._GPT2_PATTERN)
+        self._special_re = self._build_special_regex()
+        self._piece_cache: dict[str, tuple[int, ...]] = {}
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ) -> Tokenizer:
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            raw_vocab = json.load(f)
+
+        if not isinstance(raw_vocab, dict):
+            raise ValueError("Vocab file must contain a JSON object.")
+
+        decoder = {v: k for k, v in cls._gpt2_bytes_to_unicode().items()}
+        vocab: dict[int, bytes] = {}
+        for token_text, token_id in raw_vocab.items():
+            if not isinstance(token_id, int):
+                raise ValueError("Vocab values must be integer token ids.")
+            if not isinstance(token_text, str):
+                raise ValueError("Vocab keys must be strings.")
+            try:
+                token_bytes = bytes(decoder[ch] for ch in token_text)
+            except KeyError:
+                token_bytes = token_text.encode("utf-8")
+            vocab[token_id] = token_bytes
+
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                cleaned = line.rstrip("\r\n")
+                if not cleaned:
+                    continue
+                parts = cleaned.split(" ")
+                if len(parts) != 2:
+                    continue
+                left, right = parts
+                try:
+                    left_bytes = bytes(decoder[ch] for ch in left)
+                    right_bytes = bytes(decoder[ch] for ch in right)
+                except KeyError:
+                    left_bytes = left.encode("utf-8")
+                    right_bytes = right.encode("utf-8")
+                merges.append((left_bytes, right_bytes))
+
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        if not text:
+            return []
+
+        if self._special_re is None:
+            return self._encode_plain_text(text)
+
+        ids: list[int] = []
+        cursor = 0
+        for match in self._special_re.finditer(text):
+            if match.start() > cursor:
+                ids.extend(self._encode_plain_text(text[cursor : match.start()]))
+            ids.append(self.token_to_id[match.group(0).encode("utf-8")])
+            cursor = match.end()
+
+        if cursor < len(text):
+            ids.extend(self._encode_plain_text(text[cursor:]))
+        return ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for chunk in iterable:
+            yield from self.encode(chunk)
+
+    def decode(self, ids: list[int]) -> str:
+        return b"".join(self.vocab[token_id] for token_id in ids).decode("utf-8", errors="replace")
+
+    def _append_missing_special_tokens(self) -> None:
+        if not self.special_tokens:
+            return
+
+        existing_tokens = set(self.vocab.values())
+        next_id = (max(self.vocab.keys()) + 1) if self.vocab else 0
+        for token in self.special_tokens:
+            token_bytes = token.encode("utf-8")
+            if token_bytes not in existing_tokens:
+                self.vocab[next_id] = token_bytes
+                existing_tokens.add(token_bytes)
+                next_id += 1
+
+    def _build_token_to_id(self) -> dict[bytes, int]:
+        token_to_id: dict[bytes, int] = {}
+        for token_id in sorted(self.vocab):
+            token_to_id.setdefault(self.vocab[token_id], token_id)
+        return token_to_id
+
+    def _build_special_regex(self) -> re.Pattern[str] | None:
+        if not self.special_tokens:
+            return None
+        specials = sorted(self.special_tokens, key=len, reverse=True)
+        escaped = "|".join(re.escape(token) for token in specials)
+        return re.compile(f"(?:{escaped})")
+
+    def _encode_plain_text(self, text: str) -> list[int]:
+        ids: list[int] = []
+        for match in self._token_re.finditer(text):
+            piece = match.group(0)
+            if not piece:
+                continue
+
+            cached = self._piece_cache.get(piece)
+            if cached is None:
+                cached = tuple(self._encode_piece(piece))
+                self._piece_cache[piece] = cached
+            ids.extend(cached)
+        return ids
+
+    def _encode_piece(self, piece: str) -> list[int]:
+        word: Word = tuple(self._single_byte_tokens[b] for b in piece.encode("utf-8"))
+        bpe_tokens = self._apply_bpe(word)
+        return [self.token_to_id[token] for token in bpe_tokens]
+
+    def _apply_bpe(self, word: Word) -> Word:
+        if len(word) < 2:
+            return word
+
+        current = word
+        while len(current) > 1:
+            best_pair = None
+            best_rank = None
+            for i in range(len(current) - 1):
+                pair = (current[i], current[i + 1])
+                rank = self.merge_ranks.get(pair)
+                if rank is None:
+                    continue
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_pair = pair
+
+            if best_pair is None:
+                break
+            current = ByteLevelBPE._merge_pair_in_word(current, best_pair)
+
+        return current
+
+    @staticmethod
+    def _gpt2_bytes_to_unicode() -> dict[int, str]:
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(2**8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2**8 + n)
+                n += 1
+        return {b: chr(c) for b, c in zip(bs, cs)}
