@@ -1,101 +1,132 @@
-# Run Guide (TinyStories)
+# RUN Guide (TinyStories)
 
-## 为什么训练用 `.bin` 而不是直接 `.txt`
-- 训练脚本 [train.py](C:/desktoppp/cs336/assignment1-basics/cs336_basics/train.py) 采用 `np.memmap` + 随机切片采样，输入是**一维 token id 数组**，不是原始文本。
-- 如果每个 step 都从 `.txt` 现场分词，会显著拖慢训练（尤其是你后面做大量 sweep 时）。
-- 因此标准流程是：`txt -> tokenizer encode -> token ids .bin`，然后训练阶段只读 `.bin`。
+This document is Linux-first and includes the shortest commands to run end-to-end.
 
-这不是“额外负担”，而是你当前实现（和作业要求里的 memmap）对应的高效数据路径。
+## Why `.bin` instead of `.txt` for training
 
-## 最简一键训练
+The training script `cs336_basics/train.py` reads token IDs with `np.memmap`.
+That requires a contiguous numeric array on disk (`.bin`), not raw text.
 
-在仓库根目录执行：
+Using `.txt` directly would force tokenization during every training step, which is much slower and less reproducible for sweeps.
 
-```powershell
-& C:/Software/Miniconda/shell/condabin/conda-hook.ps1
-conda activate C:/Software/Miniconda/envs/cs336
-./scripts/run_tinystories_train.ps1 -UseWandb
+Standard pipeline:
+
+1. `txt -> train BPE tokenizer`
+2. `txt -> token ids .bin`
+3. `train on .bin`
+
+## Linux: one command for full pipeline
+
+From repo root:
+
+```bash
+bash scripts/run_tinystories_train.sh \
+  --conda-env cs336 \
+  --use-wandb
 ```
 
-这个脚本会自动做 3 件事：
-1. 训练 BPE（如果没 `-SkipBpe`）
-2. 把 `TinyStoriesV2-GPT4-train.txt / valid.txt` 转成 `.bin`（如果没 `-SkipTokenize`）
-3. 启动模型训练
+What this does:
 
-默认路径：
-- 文本：`data/TinyStoriesV2-GPT4-train.txt`, `data/TinyStoriesV2-GPT4-valid.txt`
-- tokenizer：`tokenizer/tinystories_bpe_vocab.pkl`, `tokenizer/tinystories_bpe_merges.pkl`
-- 二进制数据：`data/tinystories_train.bin`, `data/tinystories_val.bin`
-- 训练输出：`runs/tinystories_base`
+1. Trains BPE tokenizer (unless `--skip-bpe`)
+2. Tokenizes train/valid text into `data/tinystories_train.bin` and `data/tinystories_val.bin` (unless `--skip-tokenize`)
+3. Starts model training
 
-## 只做 tokenization（单独跑）
+Default output paths:
 
-```powershell
-uv run python scripts/tokenize_to_bin.py `
-  --input-text data/TinyStoriesV2-GPT4-train.txt `
-  --vocab-pkl tokenizer/tinystories_bpe_vocab.pkl `
-  --merges-pkl tokenizer/tinystories_bpe_merges.pkl `
-  --output-bin data/tinystories_train.bin `
+- tokenizer: `tokenizer/tinystories_bpe_vocab.pkl`, `tokenizer/tinystories_bpe_merges.pkl`
+- tokenized data: `data/tinystories_train.bin`, `data/tinystories_val.bin`
+- checkpoints/logs: `runs/tinystories_base`
+
+## Linux: baseline run for assignment settings
+
+```bash
+bash scripts/run_tinystories_train.sh \
+  --conda-env cs336 \
+  --vocab-size 10000 \
+  --context-length 256 \
+  --d-model 512 \
+  --num-heads 16 \
+  --d-ff 1344 \
+  --num-layers 4 \
+  --rope-theta 10000 \
+  --batch-size 64 \
+  --token-budget 327680000 \
+  --learning-rate 6e-4 \
+  --min-learning-rate 6e-5 \
+  --use-wandb
+```
+
+The script computes:
+
+- `total_iters = ceil(token_budget / (batch_size * context_length))`
+- `warmup_iters` from `--warmup-fraction` (default `0.02`)
+
+## Linux: tokenize only
+
+```bash
+uv run python scripts/tokenize_to_bin.py \
+  --input-text data/TinyStoriesV2-GPT4-train.txt \
+  --vocab-pkl tokenizer/tinystories_bpe_vocab.pkl \
+  --merges-pkl tokenizer/tinystories_bpe_merges.pkl \
+  --output-bin data/tinystories_train.bin \
   --dtype uint16
 ```
 
-验证集同理，把输入和输出路径改成 `valid` / `val` 即可。
+Run again for valid set with `--input-text data/TinyStoriesV2-GPT4-valid.txt` and `--output-bin data/tinystories_val.bin`.
 
-## 单 minibatch 过拟合检查（建议先跑）
+## Linux: single-minibatch overfit sanity check
 
-```powershell
-uv run python scripts/overfit_single_batch.py `
-  --train-data data/tinystories_train.bin `
-  --data-dtype uint16 `
+```bash
+uv run python scripts/overfit_single_batch.py \
+  --train-data data/tinystories_train.bin \
+  --data-dtype uint16 \
   --vocab-size 10000
 ```
 
-如果 loss 明显下降，说明前向/反向/优化基本链路正常。
+If loss drops clearly, forward/backward/optimizer path is healthy.
 
-## 你当前作业参数的一键基线训练示例
+## Linux: sweep scripts
 
-```powershell
-./scripts/run_tinystories_train.ps1 `
-  -VocabSize 10000 `
-  -ContextLength 256 `
-  -DModel 512 `
-  -NumHeads 16 `
-  -DFF 1344 `
-  -NumLayers 4 `
-  -RopeTheta 10000 `
-  -BatchSize 64 `
-  -TokenBudget 327680000 `
-  -LearningRate 6e-4 `
-  -MinLearningRate 6e-5 `
-  -UseWandb
+Learning-rate sweep:
+
+```bash
+bash scripts/lr_sweep.sh \
+  --conda-env cs336 \
+  --train-data data/tinystories_train.bin \
+  --val-data data/tinystories_val.bin \
+  --vocab-size 10000 \
+  --context-length 256 \
+  --d-model 512 \
+  --num-heads 16 \
+  --d-ff 1344 \
+  --num-layers 4 \
+  --batch-size 64 \
+  --use-wandb
 ```
 
-脚本内部会自动计算 `total_iters = ceil(TokenBudget / (batch_size * context_length))`，并给出 warmup 步数。
+Batch-size sweep:
 
-## Sweep 脚本
-
-### 学习率 sweep
-```powershell
-./scripts/lr_sweep.ps1 `
-  -TrainData data/tinystories_train.bin `
-  -ValData data/tinystories_val.bin `
-  -VocabSize 10000 `
-  -ContextLength 256 `
-  -DModel 512 -NumHeads 16 -DFF 1344 -NumLayers 4 `
-  -BatchSize 64 `
-  -UseWandb
+```bash
+bash scripts/batch_sweep.sh \
+  --conda-env cs336 \
+  --train-data data/tinystories_train.bin \
+  --val-data data/tinystories_val.bin \
+  --vocab-size 10000 \
+  --context-length 256 \
+  --d-model 512 \
+  --num-heads 16 \
+  --d-ff 1344 \
+  --num-layers 4 \
+  --batch-sizes 1,8,16,32,64,128 \
+  --use-wandb
 ```
 
-### Batch size sweep
-```powershell
-./scripts/batch_sweep.ps1 `
-  -TrainData data/tinystories_train.bin `
-  -ValData data/tinystories_val.bin `
-  -VocabSize 10000 `
-  -ContextLength 256 `
-  -DModel 512 -NumHeads 16 -DFF 1344 -NumLayers 4 `
-  -BatchSizes 1,8,16,32,64,128 `
-  -UseWandb
-```
+Both scripts write a `results.csv` in their run root.
 
-两个 sweep 都会在对应 run 目录写 `results.csv`，便于你整理 experiment log。
+## Windows scripts still available
+
+If you also use a Windows workstation, these remain available:
+
+- `scripts/run_tinystories_train.ps1`
+- `scripts/lr_sweep.ps1`
+- `scripts/batch_sweep.ps1`

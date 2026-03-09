@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/run_tinystories_train.sh [options]
+
+Core options:
+  --conda-env NAME_OR_PATH
+  --data-dir DIR                         (default: data)
+  --tokenizer-dir DIR                    (default: tokenizer)
+  --runs-dir DIR                         (default: runs/tinystories_base)
+  --train-txt FILE                       (default: TinyStoriesV2-GPT4-train.txt)
+  --val-txt FILE                         (default: TinyStoriesV2-GPT4-valid.txt)
+  --vocab-size INT                       (default: 10000)
+  --special-tokens CSV                   (default: <|endoftext|>)
+
+Model and training options:
+  --context-length INT                   (default: 256)
+  --d-model INT                          (default: 512)
+  --num-heads INT                        (default: 16)
+  --d-ff INT                             (default: 1344)
+  --num-layers INT                       (default: 4)
+  --rope-theta FLOAT                     (default: 10000)
+  --batch-size INT                       (default: 64)
+  --token-budget INT                     (default: 327680000)
+  --learning-rate FLOAT                  (default: 6e-4)
+  --min-learning-rate FLOAT              (default: 6e-5)
+  --warmup-fraction FLOAT                (default: 0.02)
+  --beta1 FLOAT                          (default: 0.9)
+  --beta2 FLOAT                          (default: 0.95)
+  --eps FLOAT                            (default: 1e-8)
+  --weight-decay FLOAT                   (default: 0.1)
+  --grad-clip FLOAT                      (default: 1.0)
+  --optimizer custom_adamw|torch_adamw   (default: custom_adamw)
+  --eval-interval INT                    (default: 500)
+  --eval-iters INT                       (default: 50)
+  --log-interval INT                     (default: 50)
+  --save-interval INT                    (default: 1000)
+  --device auto|cpu|cuda                 (default: auto)
+  --seed INT                             (default: 1337)
+
+W&B:
+  --use-wandb
+  --wandb-project NAME                   (default: cs336-assignment1)
+  --wandb-entity NAME                    (default: empty)
+  --wandb-run-name NAME                  (default: auto)
+  --wandb-mode online|offline|disabled   (default: online)
+
+Pipeline control:
+  --skip-bpe
+  --skip-tokenize
+  --bpe-progress-every INT               (default: 100)
+  --bpe-heartbeat-seconds INT            (default: 15)
+  --tokenize-progress-every-lines INT    (default: 10000)
+  -h, --help
+EOF
+}
+
+CONDA_ENV=""
+DATA_DIR="data"
+TOKENIZER_DIR="tokenizer"
+RUNS_DIR="runs/tinystories_base"
+
+TRAIN_TXT="TinyStoriesV2-GPT4-train.txt"
+VAL_TXT="TinyStoriesV2-GPT4-valid.txt"
+VOCAB_SIZE=10000
+SPECIAL_TOKENS="<|endoftext|>"
+
+CONTEXT_LENGTH=256
+D_MODEL=512
+NUM_HEADS=16
+D_FF=1344
+NUM_LAYERS=4
+ROPE_THETA=10000.0
+
+BATCH_SIZE=64
+TOKEN_BUDGET=327680000
+LEARNING_RATE=6e-4
+MIN_LEARNING_RATE=6e-5
+WARMUP_FRACTION=0.02
+BETA1=0.9
+BETA2=0.95
+EPS=1e-8
+WEIGHT_DECAY=0.1
+GRAD_CLIP=1.0
+OPTIMIZER="custom_adamw"
+
+EVAL_INTERVAL=500
+EVAL_ITERS=50
+LOG_INTERVAL=50
+SAVE_INTERVAL=1000
+DEVICE="auto"
+SEED=1337
+
+USE_WANDB=0
+WANDB_PROJECT="cs336-assignment1"
+WANDB_ENTITY=""
+WANDB_RUN_NAME=""
+WANDB_MODE="online"
+
+SKIP_BPE=0
+SKIP_TOKENIZE=0
+BPE_PROGRESS_EVERY=100
+BPE_HEARTBEAT_SECONDS=15
+TOKENIZE_PROGRESS_EVERY_LINES=10000
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --conda-env) CONDA_ENV="$2"; shift 2 ;;
+    --data-dir) DATA_DIR="$2"; shift 2 ;;
+    --tokenizer-dir) TOKENIZER_DIR="$2"; shift 2 ;;
+    --runs-dir) RUNS_DIR="$2"; shift 2 ;;
+    --train-txt) TRAIN_TXT="$2"; shift 2 ;;
+    --val-txt) VAL_TXT="$2"; shift 2 ;;
+    --vocab-size) VOCAB_SIZE="$2"; shift 2 ;;
+    --special-tokens) SPECIAL_TOKENS="$2"; shift 2 ;;
+    --context-length) CONTEXT_LENGTH="$2"; shift 2 ;;
+    --d-model) D_MODEL="$2"; shift 2 ;;
+    --num-heads) NUM_HEADS="$2"; shift 2 ;;
+    --d-ff) D_FF="$2"; shift 2 ;;
+    --num-layers) NUM_LAYERS="$2"; shift 2 ;;
+    --rope-theta) ROPE_THETA="$2"; shift 2 ;;
+    --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    --token-budget) TOKEN_BUDGET="$2"; shift 2 ;;
+    --learning-rate) LEARNING_RATE="$2"; shift 2 ;;
+    --min-learning-rate) MIN_LEARNING_RATE="$2"; shift 2 ;;
+    --warmup-fraction) WARMUP_FRACTION="$2"; shift 2 ;;
+    --beta1) BETA1="$2"; shift 2 ;;
+    --beta2) BETA2="$2"; shift 2 ;;
+    --eps) EPS="$2"; shift 2 ;;
+    --weight-decay) WEIGHT_DECAY="$2"; shift 2 ;;
+    --grad-clip) GRAD_CLIP="$2"; shift 2 ;;
+    --optimizer) OPTIMIZER="$2"; shift 2 ;;
+    --eval-interval) EVAL_INTERVAL="$2"; shift 2 ;;
+    --eval-iters) EVAL_ITERS="$2"; shift 2 ;;
+    --log-interval) LOG_INTERVAL="$2"; shift 2 ;;
+    --save-interval) SAVE_INTERVAL="$2"; shift 2 ;;
+    --device) DEVICE="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --use-wandb) USE_WANDB=1; shift ;;
+    --wandb-project) WANDB_PROJECT="$2"; shift 2 ;;
+    --wandb-entity) WANDB_ENTITY="$2"; shift 2 ;;
+    --wandb-run-name) WANDB_RUN_NAME="$2"; shift 2 ;;
+    --wandb-mode) WANDB_MODE="$2"; shift 2 ;;
+    --skip-bpe) SKIP_BPE=1; shift ;;
+    --skip-tokenize) SKIP_TOKENIZE=1; shift ;;
+    --bpe-progress-every) BPE_PROGRESS_EVERY="$2"; shift 2 ;;
+    --bpe-heartbeat-seconds) BPE_HEARTBEAT_SECONDS="$2"; shift 2 ;;
+    --tokenize-progress-every-lines) TOKENIZE_PROGRESS_EVERY_LINES="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+activate_conda() {
+  if [[ -z "$CONDA_ENV" ]]; then
+    return
+  fi
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  if [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  echo "Warning: cannot activate conda env '$CONDA_ENV' automatically." >&2
+}
+
+activate_conda
+
+TRAIN_TXT_PATH="${DATA_DIR}/${TRAIN_TXT}"
+VAL_TXT_PATH="${DATA_DIR}/${VAL_TXT}"
+VOCAB_PKL="${TOKENIZER_DIR}/tinystories_bpe_vocab.pkl"
+MERGES_PKL="${TOKENIZER_DIR}/tinystories_bpe_merges.pkl"
+TRAIN_BIN="${DATA_DIR}/tinystories_train.bin"
+VAL_BIN="${DATA_DIR}/tinystories_val.bin"
+TRAIN_META="${TRAIN_BIN}.meta.json"
+VAL_META="${VAL_BIN}.meta.json"
+
+mkdir -p "$TOKENIZER_DIR" "$DATA_DIR" "$RUNS_DIR"
+
+if [[ ! -f "$TRAIN_TXT_PATH" ]]; then
+  echo "Missing train txt: $TRAIN_TXT_PATH" >&2
+  exit 1
+fi
+if [[ ! -f "$VAL_TXT_PATH" ]]; then
+  echo "Missing val txt: $VAL_TXT_PATH" >&2
+  exit 1
+fi
+
+if [[ "$SKIP_BPE" -eq 0 ]]; then
+  echo "============================================================"
+  echo "Step 1/3: train BPE tokenizer"
+  uv run python -m cs336_basics.train_bpe \
+    --input-path "$TRAIN_TXT_PATH" \
+    --vocab-size "$VOCAB_SIZE" \
+    --special-tokens "$SPECIAL_TOKENS" \
+    --progress-every "$BPE_PROGRESS_EVERY" \
+    --heartbeat-seconds "$BPE_HEARTBEAT_SECONDS" \
+    --tokenizer-dir "$TOKENIZER_DIR" \
+    --vocab-out "$VOCAB_PKL" \
+    --merges-out "$MERGES_PKL"
+fi
+
+if [[ ! -f "$VOCAB_PKL" || ! -f "$MERGES_PKL" ]]; then
+  echo "Tokenizer files missing: $VOCAB_PKL or $MERGES_PKL" >&2
+  exit 1
+fi
+
+if [[ "$SKIP_TOKENIZE" -eq 0 ]]; then
+  echo "============================================================"
+  echo "Step 2/3: tokenize txt -> bin"
+  uv run python scripts/tokenize_to_bin.py \
+    --input-text "$TRAIN_TXT_PATH" \
+    --vocab-pkl "$VOCAB_PKL" \
+    --merges-pkl "$MERGES_PKL" \
+    --output-bin "$TRAIN_BIN" \
+    --output-meta "$TRAIN_META" \
+    --special-tokens "$SPECIAL_TOKENS" \
+    --dtype uint16 \
+    --progress-every-lines "$TOKENIZE_PROGRESS_EVERY_LINES"
+
+  uv run python scripts/tokenize_to_bin.py \
+    --input-text "$VAL_TXT_PATH" \
+    --vocab-pkl "$VOCAB_PKL" \
+    --merges-pkl "$MERGES_PKL" \
+    --output-bin "$VAL_BIN" \
+    --output-meta "$VAL_META" \
+    --special-tokens "$SPECIAL_TOKENS" \
+    --dtype uint16 \
+    --progress-every-lines "$TOKENIZE_PROGRESS_EVERY_LINES"
+fi
+
+if [[ ! -f "$TRAIN_BIN" || ! -f "$VAL_BIN" ]]; then
+  echo "Tokenized bin files missing: $TRAIN_BIN or $VAL_BIN" >&2
+  exit 1
+fi
+
+tokens_per_step=$((BATCH_SIZE * CONTEXT_LENGTH))
+steps=$(((TOKEN_BUDGET + tokens_per_step - 1) / tokens_per_step))
+warmup_iters="$(awk -v s="$steps" -v f="$WARMUP_FRACTION" 'BEGIN { v=int(s*f + 0.5); if (v < 1) v=1; print v }')"
+
+if [[ -z "$WANDB_RUN_NAME" ]]; then
+  WANDB_RUN_NAME="tinystories_base_bs${BATCH_SIZE}_ctx${CONTEXT_LENGTH}_$(date +%Y%m%d_%H%M%S)"
+fi
+
+echo "============================================================"
+echo "Step 3/3: train model"
+echo "train_bin: $TRAIN_BIN"
+echo "val_bin:   $VAL_BIN"
+echo "steps:     $steps"
+echo "warmup:    $warmup_iters"
+echo "save_dir:  $RUNS_DIR"
+
+train_args=(
+  python -m cs336_basics.train
+  --train-data "$TRAIN_BIN"
+  --val-data "$VAL_BIN"
+  --data-dtype uint16
+  --vocab-size "$VOCAB_SIZE"
+  --context-length "$CONTEXT_LENGTH"
+  --d-model "$D_MODEL"
+  --num-heads "$NUM_HEADS"
+  --d-ff "$D_FF"
+  --num-layers "$NUM_LAYERS"
+  --rope-theta "$ROPE_THETA"
+  --optimizer "$OPTIMIZER"
+  --batch-size "$BATCH_SIZE"
+  --total-iters "$steps"
+  --learning-rate "$LEARNING_RATE"
+  --min-learning-rate "$MIN_LEARNING_RATE"
+  --warmup-iters "$warmup_iters"
+  --beta1 "$BETA1"
+  --beta2 "$BETA2"
+  --eps "$EPS"
+  --weight-decay "$WEIGHT_DECAY"
+  --grad-clip "$GRAD_CLIP"
+  --eval-interval "$EVAL_INTERVAL"
+  --eval-iters "$EVAL_ITERS"
+  --log-interval "$LOG_INTERVAL"
+  --save-interval "$SAVE_INTERVAL"
+  --save-dir "$RUNS_DIR"
+  --device "$DEVICE"
+  --seed "$SEED"
+)
+
+if [[ "$USE_WANDB" -eq 1 ]]; then
+  train_args+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-run-name "$WANDB_RUN_NAME" --wandb-mode "$WANDB_MODE")
+  if [[ -n "$WANDB_ENTITY" ]]; then
+    train_args+=(--wandb-entity "$WANDB_ENTITY")
+  fi
+fi
+
+uv run "${train_args[@]}"
+
+echo "============================================================"
+echo "Done."
+echo "Tokenizer:"
+echo "  $VOCAB_PKL"
+echo "  $MERGES_PKL"
+echo "Tokenized data:"
+echo "  $TRAIN_BIN"
+echo "  $VAL_BIN"
+echo "Checkpoints:"
+echo "  $RUNS_DIR"
