@@ -43,6 +43,45 @@ Checkpoint retention:
 - `best.pt`, `latest.pt`, `final.pt`, and `interrupted_step_*.pt` are kept separately
 - override with `--keep-last-checkpoints N` on `scripts/run_tinystories_train.sh` or `scripts/run_tinystories_train.ps1`
 
+## Resume training from a checkpoint
+
+If a run was interrupted, the most convenient resume path is:
+
+```bash
+uv run python scripts/resume_training.py \
+  --checkpoint runs/tinystories_base/latest.pt
+```
+
+By default this script looks for `run_config.json` in the same directory as the checkpoint, rebuilds the original training command, and adds `--resume <checkpoint>`.
+
+Recommended checkpoint choice:
+
+- `latest.pt`: normal resume target
+- `interrupted_step_XXXXXXXX.pt`: when you stopped with `Ctrl+C`
+- `step_XXXXXXXX.pt`: manual fallback if needed
+
+Common override example: extend total training length while resuming
+
+```bash
+uv run python scripts/resume_training.py \
+  --checkpoint runs/tinystories_base/latest.pt \
+  --set total_iters=40000
+```
+
+You can override any saved config entry with repeated `--set key=value`, for example:
+
+- `--set device=cuda`
+- `--set wandb_mode=disabled`
+- `--set keep_last_checkpoints=3`
+
+If your config file is not in the checkpoint directory, pass it explicitly:
+
+```bash
+uv run python scripts/resume_training.py \
+  --checkpoint runs/tinystories_base/latest.pt \
+  --config runs/tinystories_base/run_config.json
+```
+
 ## Linux: baseline run for assignment settings
 
 ```bash
