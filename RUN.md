@@ -37,6 +37,12 @@ Default output paths:
 - tokenized data: `data/tinystories_train.bin`, `data/tinystories_val.bin`
 - checkpoints/logs: `runs/tinystories_base`
 
+Checkpoint retention:
+
+- periodic `step_*.pt` checkpoints now keep only the newest `3` by default
+- `best.pt`, `latest.pt`, `final.pt`, and `interrupted_step_*.pt` are kept separately
+- override with `--keep-last-checkpoints N` on `scripts/run_tinystories_train.sh` or `scripts/run_tinystories_train.ps1`
+
 ## Linux: baseline run for assignment settings
 
 ```bash

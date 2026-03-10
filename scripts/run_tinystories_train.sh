@@ -37,6 +37,7 @@ Model and training options:
   --eval-iters INT                       (default: 50)
   --log-interval INT                     (default: 50)
   --save-interval INT                    (default: 1000)
+  --keep-last-checkpoints INT            (default: 3)
   --device auto|cpu|cuda                 (default: auto)
   --seed INT                             (default: 1337)
 
@@ -90,6 +91,7 @@ EVAL_INTERVAL=500
 EVAL_ITERS=50
 LOG_INTERVAL=50
 SAVE_INTERVAL=1000
+KEEP_LAST_CHECKPOINTS=3
 DEVICE="auto"
 SEED=1337
 
@@ -136,6 +138,7 @@ while [[ $# -gt 0 ]]; do
     --eval-iters) EVAL_ITERS="$2"; shift 2 ;;
     --log-interval) LOG_INTERVAL="$2"; shift 2 ;;
     --save-interval) SAVE_INTERVAL="$2"; shift 2 ;;
+    --keep-last-checkpoints) KEEP_LAST_CHECKPOINTS="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --use-wandb) USE_WANDB=1; shift ;;
@@ -290,6 +293,7 @@ train_args=(
   --eval-iters "$EVAL_ITERS"
   --log-interval "$LOG_INTERVAL"
   --save-interval "$SAVE_INTERVAL"
+  --keep-last-checkpoints "$KEEP_LAST_CHECKPOINTS"
   --save-dir "$RUNS_DIR"
   --device "$DEVICE"
   --seed "$SEED"

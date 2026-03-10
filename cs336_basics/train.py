@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ NP_DTYPES: dict[str, np.dtype[Any]] = {
     "int32": np.dtype(np.int32),
     "int64": np.dtype(np.int64),
 }
+STEP_CHECKPOINT_RE = re.compile(r"^step_(\d+)\.pt$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-interval", type=int, default=500, help="Run validation every N iterations.")
     parser.add_argument("--eval-iters", type=int, default=50, help="Validation minibatches per evaluation.")
     parser.add_argument("--save-interval", type=int, default=1000, help="Save checkpoint every N iterations.")
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=3,
+        help="How many periodic step_*.pt checkpoints to retain. Special checkpoints are always kept.",
+    )
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Checkpoint output directory.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from.")
 
@@ -116,6 +124,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be positive.")
     if args.log_interval <= 0 or args.eval_interval <= 0 or args.eval_iters <= 0 or args.save_interval <= 0:
         raise ValueError("--log/eval/save intervals must all be positive.")
+    if args.keep_last_checkpoints < 0:
+        raise ValueError("--keep-last-checkpoints must be >= 0.")
     if args.vocab_size <= 0:
         raise ValueError("--vocab-size must be positive.")
     if args.d_model <= 0 or args.d_ff <= 0 or args.num_layers <= 0 or args.num_heads <= 0:
@@ -157,6 +167,28 @@ def build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.O
     if args.optimizer == "torch_adamw":
         return TorchAdamW(model.parameters(), **kwargs)
     return CustomAdamW(model.parameters(), **kwargs)
+
+
+def prune_old_step_checkpoints(save_dir: Path, keep_last: int) -> list[Path]:
+    step_checkpoints: list[tuple[int, Path]] = []
+    for path in save_dir.glob("step_*.pt"):
+        match = STEP_CHECKPOINT_RE.match(path.name)
+        if match is None:
+            continue
+        step_checkpoints.append((int(match.group(1)), path))
+
+    step_checkpoints.sort(key=lambda item: item[0])
+    if keep_last == 0:
+        stale = step_checkpoints
+    else:
+        stale = step_checkpoints[:-keep_last]
+
+    removed: list[Path] = []
+    for _, path in stale:
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def estimate_loss(
@@ -332,6 +364,10 @@ def train(args: argparse.Namespace) -> None:
                 save_checkpoint(model, optimizer, step, ckpt_path)
                 save_checkpoint(model, optimizer, step, save_dir / "latest.pt")
                 print(f"  checkpoint saved: {ckpt_path}")
+                removed = prune_old_step_checkpoints(save_dir, args.keep_last_checkpoints)
+                if removed:
+                    removed_names = ", ".join(path.name for path in removed)
+                    print(f"  pruned old checkpoints: {removed_names}")
 
     except KeyboardInterrupt:
         interrupted_path = save_dir / f"interrupted_step_{last_completed_step:08d}.pt"

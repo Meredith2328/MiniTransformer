@@ -32,6 +32,7 @@ param(
     [int]$EvalIters = 50,
     [int]$LogInterval = 50,
     [int]$SaveInterval = 1000,
+    [int]$KeepLastCheckpoints = 3,
     [string]$Device = "auto",
     [int]$Seed = 1337,
 
@@ -167,6 +168,7 @@ $trainArgs = @(
     "--eval-iters", $EvalIters,
     "--log-interval", $LogInterval,
     "--save-interval", $SaveInterval,
+    "--keep-last-checkpoints", $KeepLastCheckpoints,
     "--save-dir", $RunsDir,
     "--device", $Device,
     "--seed", $Seed
