@@ -12,6 +12,8 @@ OMIT_CONFIG_KEYS = {
     "resolved_device",
     "resume",
 }
+INTERRUPTED_CHECKPOINT_PREFIX = "interrupted_step_"
+STEP_CHECKPOINT_PREFIX = "step_"
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,8 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
-        help="Checkpoint path to resume from, usually latest.pt or interrupted_step_*.pt.",
+        default="",
+        help="Checkpoint path to resume from. If omitted, the script auto-selects from --run-dir.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default="runs/tinystories_base",
+        help="Training run directory used for auto-discovery when --checkpoint is omitted.",
     )
     parser.add_argument(
         "--config",
@@ -49,6 +57,54 @@ def infer_config_path(checkpoint_path: Path, config_arg: str) -> Path:
     if config_arg:
         return Path(config_arg)
     return checkpoint_path.parent / "run_config.json"
+
+
+def infer_run_dir(args: argparse.Namespace) -> Path:
+    if args.checkpoint:
+        return Path(args.checkpoint).parent
+    if args.config:
+        return Path(args.config).parent
+    return Path(args.run_dir)
+
+
+def parse_step_from_name(path: Path, prefix: str) -> int:
+    stem = path.stem
+    if not stem.startswith(prefix):
+        return -1
+    suffix = stem[len(prefix) :]
+    try:
+        return int(suffix)
+    except ValueError:
+        return -1
+
+
+def select_checkpoint(run_dir: Path) -> Path:
+    latest_path = run_dir / "latest.pt"
+    if latest_path.exists():
+        return latest_path
+
+    interrupted_paths = sorted(
+        (path for path in run_dir.glob("interrupted_step_*.pt")),
+        key=lambda path: parse_step_from_name(path, INTERRUPTED_CHECKPOINT_PREFIX),
+    )
+    if interrupted_paths:
+        return interrupted_paths[-1]
+
+    step_paths = sorted(
+        (path for path in run_dir.glob("step_*.pt")),
+        key=lambda path: parse_step_from_name(path, STEP_CHECKPOINT_PREFIX),
+    )
+    if step_paths:
+        return step_paths[-1]
+
+    final_path = run_dir / "final.pt"
+    if final_path.exists():
+        return final_path
+
+    raise FileNotFoundError(
+        f"No resumable checkpoint found in {run_dir}. "
+        "Looked for latest.pt, interrupted_step_*.pt, step_*.pt, and final.pt."
+    )
 
 
 def parse_override(raw: str) -> tuple[str, str]:
@@ -123,7 +179,8 @@ def build_train_command(config: dict[str, Any], checkpoint_path: Path) -> list[s
 def main() -> None:
     args = parse_args()
 
-    checkpoint_path = Path(args.checkpoint)
+    run_dir = infer_run_dir(args)
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else select_checkpoint(run_dir)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
@@ -140,6 +197,7 @@ def main() -> None:
     command = build_train_command(effective_config, checkpoint_path)
 
     print("Resume configuration:")
+    print(f"  run_dir:    {run_dir}")
     print(f"  checkpoint: {checkpoint_path}")
     print(f"  config:     {config_path}")
     if args.overrides:

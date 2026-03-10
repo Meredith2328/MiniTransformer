@@ -48,6 +48,26 @@ Checkpoint retention:
 If a run was interrupted, the most convenient resume path is:
 
 ```bash
+uv run python scripts/resume_training.py
+```
+
+That defaults to `runs/tinystories_base` and auto-selects checkpoints in this order:
+
+1. `latest.pt`
+2. newest `interrupted_step_XXXXXXXX.pt`
+3. newest `step_XXXXXXXX.pt`
+4. `final.pt`
+
+If your run directory is different, point at it explicitly:
+
+```bash
+uv run python scripts/resume_training.py \
+  --run-dir runs/my_experiment
+```
+
+You can still provide an explicit checkpoint when needed:
+
+```bash
 uv run python scripts/resume_training.py \
   --checkpoint runs/tinystories_base/latest.pt
 ```
