@@ -6,8 +6,12 @@ param(
 
     [string]$TrainTxt = "TinyStoriesV2-GPT4-train.txt",
     [string]$ValTxt = "TinyStoriesV2-GPT4-valid.txt",
+    [string]$TrainBin = "tinystories_train.bin",
+    [string]$ValBin = "tinystories_val.bin",
     [int]$VocabSize = 10000,
     [string]$SpecialTokens = "<|endoftext|>",
+    [ValidateSet("uint16", "uint32", "int32", "int64")]
+    [string]$DataDtype = "uint16",
 
     [int]$ContextLength = 256,
     [int]$DModel = 512,
@@ -52,32 +56,73 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Resolve-PathArg {
+    param(
+        [string]$BaseDir,
+        [string]$Value
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return $Value
+    }
+    if ($Value.Contains([System.IO.Path]::DirectorySeparatorChar) -or $Value.Contains([System.IO.Path]::AltDirectorySeparatorChar)) {
+        return $Value
+    }
+    return (Join-Path $BaseDir $Value)
+}
+
+function Require-File {
+    param(
+        [string]$Label,
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        throw "Missing ${Label}: $Path"
+    }
+}
+
+$trainBinProvided = $PSBoundParameters.ContainsKey("TrainBin")
+$valBinProvided = $PSBoundParameters.ContainsKey("ValBin")
+$valTxtProvided = $PSBoundParameters.ContainsKey("ValTxt")
+
 if (Test-Path "C:\Software\Miniconda\shell\condabin\conda-hook.ps1") {
     & C:\Software\Miniconda\shell\condabin\conda-hook.ps1
     conda activate $CondaEnvPath
 }
 
-$trainTxtPath = Join-Path $DataDir $TrainTxt
-$valTxtPath = Join-Path $DataDir $ValTxt
-if (-not (Test-Path $trainTxtPath)) {
-    throw "Training txt not found: $trainTxtPath"
-}
-if (-not (Test-Path $valTxtPath)) {
-    throw "Validation txt not found: $valTxtPath"
-}
+$trainTxtPath = Resolve-PathArg -BaseDir $DataDir -Value $TrainTxt
+$valTxtPath = Resolve-PathArg -BaseDir $DataDir -Value $ValTxt
+$TrainBin = Resolve-PathArg -BaseDir $DataDir -Value $TrainBin
+$ValBin = Resolve-PathArg -BaseDir $DataDir -Value $ValBin
 
 New-Item -ItemType Directory -Path $TokenizerDir -Force | Out-Null
-New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 New-Item -ItemType Directory -Path $RunsDir -Force | Out-Null
+if (-not [string]::IsNullOrWhiteSpace($DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+}
+New-Item -ItemType Directory -Path (Split-Path -Parent $TrainBin) -Force | Out-Null
+
+$useVal = $true
+if (($valBinProvided -and [string]::IsNullOrWhiteSpace($ValBin)) -or ($valTxtProvided -and [string]::IsNullOrWhiteSpace($ValTxt))) {
+    $useVal = $false
+}
+if ($useVal -and -not [string]::IsNullOrWhiteSpace($ValBin)) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ValBin) -Force | Out-Null
+}
 
 $vocabPkl = Join-Path $TokenizerDir "tinystories_bpe_vocab.pkl"
 $mergesPkl = Join-Path $TokenizerDir "tinystories_bpe_merges.pkl"
-$trainBin = Join-Path $DataDir "tinystories_train.bin"
-$valBin = Join-Path $DataDir "tinystories_val.bin"
-$trainMeta = "$trainBin.meta.json"
-$valMeta = "$valBin.meta.json"
+$trainMeta = "$TrainBin.meta.json"
+$valMeta = "$ValBin.meta.json"
 
 if (-not $SkipBpe) {
+    if ([string]::IsNullOrWhiteSpace($trainTxtPath)) {
+        throw "BPE training requires -TrainTxt."
+    }
+    Require-File -Label "train txt" -Path $trainTxtPath
+
     Write-Host "============================================================"
     Write-Host "Step 1/3: Train BPE tokenizer"
     & uv run python -m cs336_basics.train_bpe `
@@ -92,38 +137,65 @@ if (-not $SkipBpe) {
     if ($LASTEXITCODE -ne 0) { throw "BPE training failed." }
 }
 
-if (-not (Test-Path $vocabPkl) -or -not (Test-Path $mergesPkl)) {
-    throw "Tokenizer artifacts missing: $vocabPkl / $mergesPkl"
-}
-
 if (-not $SkipTokenize) {
+    if ([string]::IsNullOrWhiteSpace($trainTxtPath)) {
+        throw "Tokenization requires -TrainTxt."
+    }
+    Require-File -Label "train txt" -Path $trainTxtPath
+    Require-File -Label "tokenizer vocab" -Path $vocabPkl
+    Require-File -Label "tokenizer merges" -Path $mergesPkl
+
     Write-Host "============================================================"
     Write-Host "Step 2/3: Tokenize train/val txt to .bin"
     & uv run python scripts/tokenize_to_bin.py `
         --input-text $trainTxtPath `
         --vocab-pkl $vocabPkl `
         --merges-pkl $mergesPkl `
-        --output-bin $trainBin `
+        --output-bin $TrainBin `
         --output-meta $trainMeta `
         --special-tokens $SpecialTokens `
-        --dtype uint16 `
+        --dtype $DataDtype `
         --progress-every-lines $TokenizeProgressEveryLines
     if ($LASTEXITCODE -ne 0) { throw "Train tokenization failed." }
 
-    & uv run python scripts/tokenize_to_bin.py `
-        --input-text $valTxtPath `
-        --vocab-pkl $vocabPkl `
-        --merges-pkl $mergesPkl `
-        --output-bin $valBin `
-        --output-meta $valMeta `
-        --special-tokens $SpecialTokens `
-        --dtype uint16 `
-        --progress-every-lines $TokenizeProgressEveryLines
-    if ($LASTEXITCODE -ne 0) { throw "Val tokenization failed." }
+    if ($useVal) {
+        if ([string]::IsNullOrWhiteSpace($valTxtPath)) {
+            throw "Validation tokenization requires -ValTxt, or disable validation with -ValBin ''."
+        }
+        Require-File -Label "val txt" -Path $valTxtPath
+
+        & uv run python scripts/tokenize_to_bin.py `
+            --input-text $valTxtPath `
+            --vocab-pkl $vocabPkl `
+            --merges-pkl $mergesPkl `
+            --output-bin $ValBin `
+            --output-meta $valMeta `
+            --special-tokens $SpecialTokens `
+            --dtype $DataDtype `
+            --progress-every-lines $TokenizeProgressEveryLines
+        if ($LASTEXITCODE -ne 0) { throw "Val tokenization failed." }
+    }
+}
+else {
+    Require-File -Label "train bin" -Path $TrainBin
+    if ($useVal) {
+        if (Test-Path $ValBin) {
+            # keep validation enabled
+        }
+        elseif ($valBinProvided) {
+            throw "Missing val bin: $ValBin"
+        }
+        else {
+            Write-Host "Validation bin not found at $ValBin. Continuing without validation."
+            $useVal = $false
+            $ValBin = ""
+        }
+    }
 }
 
-if (-not (Test-Path $trainBin) -or -not (Test-Path $valBin)) {
-    throw "Tokenized data missing: $trainBin / $valBin"
+Require-File -Label "train bin" -Path $TrainBin
+if ($useVal) {
+    Require-File -Label "val bin" -Path $ValBin
 }
 
 $steps = [int][Math]::Ceiling($TokenBudget / ($BatchSize * $ContextLength))
@@ -133,19 +205,20 @@ if ([string]::IsNullOrWhiteSpace($WandbRunName)) {
     $WandbRunName = "tinystories_base_bs${BatchSize}_ctx${ContextLength}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 }
 
+$valDisplay = if ($useVal) { $ValBin } else { "(disabled)" }
+
 Write-Host "============================================================"
 Write-Host "Step 3/3: Train model"
-Write-Host "  train_bin: $trainBin"
-Write-Host "  val_bin:   $valBin"
+Write-Host "  train_bin: $TrainBin"
+Write-Host "  val_bin:   $valDisplay"
 Write-Host "  steps:     $steps"
 Write-Host "  warmup:    $warmupIters"
 Write-Host "  save_dir:  $RunsDir"
 
 $trainArgs = @(
     "python", "-m", "cs336_basics.train",
-    "--train-data", $trainBin,
-    "--val-data", $valBin,
-    "--data-dtype", "uint16",
+    "--train-data", $TrainBin,
+    "--data-dtype", $DataDtype,
     "--vocab-size", $VocabSize,
     "--context-length", $ContextLength,
     "--d-model", $DModel,
@@ -174,6 +247,10 @@ $trainArgs = @(
     "--seed", $Seed
 )
 
+if ($useVal) {
+    $trainArgs += @("--val-data", $ValBin)
+}
+
 if ($UseWandb) {
     $trainArgs += @("--wandb", "--wandb-project", $WandbProject, "--wandb-run-name", $WandbRunName, "--wandb-mode", $WandbMode)
     if (-not [string]::IsNullOrWhiteSpace($WandbEntity)) {
@@ -192,7 +269,7 @@ Write-Host "Tokenizer:"
 Write-Host "  $vocabPkl"
 Write-Host "  $mergesPkl"
 Write-Host "Tokenized data:"
-Write-Host "  $trainBin"
-Write-Host "  $valBin"
+Write-Host "  $TrainBin"
+Write-Host "  $valDisplay"
 Write-Host "Checkpoints:"
 Write-Host "  $RunsDir"

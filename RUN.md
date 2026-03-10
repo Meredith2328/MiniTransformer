@@ -1,13 +1,12 @@
 # RUN Guide (TinyStories)
 
-This document is Linux-first and includes the shortest commands to run end-to-end.
+This document is Linux-first and focuses on the shortest commands that cover the full TinyStories workflow.
 
 ## Why `.bin` instead of `.txt` for training
 
-The training script `cs336_basics/train.py` reads token IDs with `np.memmap`.
-That requires a contiguous numeric array on disk (`.bin`), not raw text.
-
-Using `.txt` directly would force tokenization during every training step, which is much slower and less reproducible for sweeps.
+`cs336_basics/train.py` loads token IDs through `np.memmap`, so the training loop expects a contiguous numeric array on disk.
+That is exactly what the tokenized `.bin` files provide.
+Using raw `.txt` for training would force repeated tokenization inside the training loop, which is slower and makes sweeps less reproducible.
 
 Standard pipeline:
 
@@ -15,7 +14,7 @@ Standard pipeline:
 2. `txt -> token ids .bin`
 3. `train on .bin`
 
-## Linux: one command for full pipeline
+## Full pipeline: one command
 
 From repo root:
 
@@ -25,86 +24,47 @@ bash scripts/run_tinystories_train.sh \
   --use-wandb
 ```
 
-What this does:
+This wrapper handles three stages:
 
-1. Trains BPE tokenizer (unless `--skip-bpe`)
-2. Tokenizes train/valid text into `data/tinystories_train.bin` and `data/tinystories_val.bin` (unless `--skip-tokenize`)
-3. Starts model training
+1. train BPE unless `--skip-bpe`
+2. tokenize train/val text unless `--skip-tokenize`
+3. launch `cs336_basics.train`
 
-Default output paths:
+If `uv` is not on your shell `PATH`, the Linux shell wrappers also accept `UV_BIN=/absolute/path/to/uv`.
+
+Default outputs:
 
 - tokenizer: `tokenizer/tinystories_bpe_vocab.pkl`, `tokenizer/tinystories_bpe_merges.pkl`
 - tokenized data: `data/tinystories_train.bin`, `data/tinystories_val.bin`
 - checkpoints/logs: `runs/tinystories_base`
 
-Checkpoint retention:
+## Train directly from existing `.bin`
 
-- periodic `step_*.pt` checkpoints now keep only the newest `3` by default
-- `best.pt`, `latest.pt`, `final.pt`, and `interrupted_step_*.pt` are kept separately
-- override with `--keep-last-checkpoints N` on `scripts/run_tinystories_train.sh` or `scripts/run_tinystories_train.ps1`
-
-## Resume training from a checkpoint
-
-If a run was interrupted, the most convenient resume path is:
+If BPE and tokenization are already done:
 
 ```bash
-uv run python scripts/resume_training.py
+bash scripts/run_tinystories_train.sh \
+  --conda-env cs336 \
+  --skip-bpe \
+  --skip-tokenize \
+  --train-bin data/tinystories_train.bin \
+  --val-bin data/tinystories_val.bin \
+  --data-dtype uint16
 ```
 
-That defaults to `runs/tinystories_base` and auto-selects checkpoints in this order:
-
-1. `latest.pt`
-2. newest `interrupted_step_XXXXXXXX.pt`
-3. newest `step_XXXXXXXX.pt`
-4. `final.pt`
-
-If your run directory is different, point at it explicitly:
+If you want train-only without validation, disable validation explicitly:
 
 ```bash
-uv run python scripts/resume_training.py \
-  --run-dir runs/my_experiment
+bash scripts/run_tinystories_train.sh \
+  --conda-env cs336 \
+  --skip-bpe \
+  --skip-tokenize \
+  --train-bin data/tinystories_train.bin \
+  --val-bin "" \
+  --val-txt ""
 ```
 
-You can still provide an explicit checkpoint when needed:
-
-```bash
-uv run python scripts/resume_training.py \
-  --checkpoint runs/tinystories_base/latest.pt
-```
-
-By default this script looks for `run_config.json` in the same directory as the checkpoint, rebuilds the original training command, and adds `--resume <checkpoint>`.
-
-Resume also restores the saved best-validation record from the checkpoint metadata, so `best.pt` will not be overwritten by a worse validation score after restart.
-
-Recommended checkpoint choice:
-
-- `latest.pt`: normal resume target
-- `interrupted_step_XXXXXXXX.pt`: when you stopped with `Ctrl+C`
-- `step_XXXXXXXX.pt`: manual fallback if needed
-
-Common override example: extend total training length while resuming
-
-```bash
-uv run python scripts/resume_training.py \
-  --checkpoint runs/tinystories_base/latest.pt \
-  --set total_iters=40000
-```
-
-You can override any saved config entry with repeated `--set key=value`, for example:
-
-- `--set device=cuda`
-- `--set wandb_mode=disabled`
-- `--set keep_last_checkpoints=3`
-
-If your config file is not in the checkpoint directory, pass it explicitly:
-
-```bash
-uv run python scripts/resume_training.py \
-  --checkpoint runs/tinystories_base/latest.pt \
-  --config runs/tinystories_base/run_config.json
-```
-
-## Linux: baseline run for assignment settings
+## Assignment baseline configuration
 
 ```bash
 bash scripts/run_tinystories_train.sh \
@@ -123,36 +83,75 @@ bash scripts/run_tinystories_train.sh \
   --use-wandb
 ```
 
-The script computes:
+The wrapper computes:
 
 - `total_iters = ceil(token_budget / (batch_size * context_length))`
 - `warmup_iters` from `--warmup-fraction` (default `0.02`)
 
-## Linux: tokenize only
+## Checkpoint retention
+
+Periodic checkpoints now keep only the newest `3` `step_*.pt` files by default.
+These special files are retained separately:
+
+- `best.pt`
+- `latest.pt`
+- `final.pt`
+- `interrupted_step_*.pt`
+
+Override retention with `--keep-last-checkpoints N`.
+Because `lr_sweep` and `batch_sweep` now reuse `run_tinystories_train`, they inherit the same checkpoint policy automatically.
+
+## Resume training
+
+Preferred Linux entrypoint:
 
 ```bash
-uv run python scripts/tokenize_to_bin.py \
-  --input-text data/TinyStoriesV2-GPT4-train.txt \
-  --vocab-pkl tokenizer/tinystories_bpe_vocab.pkl \
-  --merges-pkl tokenizer/tinystories_bpe_merges.pkl \
-  --output-bin data/tinystories_train.bin \
-  --dtype uint16
+bash scripts/resume_training.sh \
+  --conda-env cs336
 ```
 
-Run again for valid set with `--input-text data/TinyStoriesV2-GPT4-valid.txt` and `--output-bin data/tinystories_val.bin`.
+This defaults to `runs/tinystories_base` and auto-selects checkpoints in this order:
 
-## Linux: single-minibatch overfit sanity check
+1. `latest.pt`
+2. newest `interrupted_step_XXXXXXXX.pt`
+3. newest `step_XXXXXXXX.pt`
+4. `final.pt`
+
+Point it at another run directory when needed:
 
 ```bash
-uv run python scripts/overfit_single_batch.py \
-  --train-data data/tinystories_train.bin \
-  --data-dtype uint16 \
-  --vocab-size 10000
+bash scripts/resume_training.sh \
+  --conda-env cs336 \
+  --run-dir runs/my_experiment
 ```
 
-If loss drops clearly, forward/backward/optimizer path is healthy.
+Explicit checkpoint also works:
 
-## Linux: sweep scripts
+```bash
+bash scripts/resume_training.sh \
+  --conda-env cs336 \
+  --checkpoint runs/tinystories_base/latest.pt
+```
+
+The underlying module is:
+
+```bash
+uv run python -m cs336_basics.resume_training --dry-run
+```
+
+Resume reads `run_config.json`, reconstructs the original training command, appends `--resume <checkpoint>`, and restores saved best-validation metadata so `best.pt` is not overwritten after restart by a worse validation score.
+
+Useful overrides:
+
+```bash
+bash scripts/resume_training.sh \
+  --conda-env cs336 \
+  --checkpoint runs/tinystories_base/latest.pt \
+  --set total_iters=40000 \
+  --set wandb_mode=disabled
+```
+
+## Sweep scripts
 
 Learning-rate sweep:
 
@@ -188,11 +187,33 @@ bash scripts/batch_sweep.sh \
   --use-wandb
 ```
 
-Both scripts write a `results.csv` in their run root.
+Both sweeps write a `results.csv` under their run root and now delegate actual training to `run_tinystories_train`.
 
-## Windows scripts still available
+## Tokenize only
 
-If you also use a Windows workstation, these remain available:
+```bash
+uv run python scripts/tokenize_to_bin.py \
+  --input-text data/TinyStoriesV2-GPT4-train.txt \
+  --vocab-pkl tokenizer/tinystories_bpe_vocab.pkl \
+  --merges-pkl tokenizer/tinystories_bpe_merges.pkl \
+  --output-bin data/tinystories_train.bin \
+  --dtype uint16
+```
+
+Run the same command for validation with `--input-text data/TinyStoriesV2-GPT4-valid.txt` and `--output-bin data/tinystories_val.bin`.
+
+## Single-minibatch sanity check
+
+```bash
+uv run python scripts/overfit_single_batch.py \
+  --train-data data/tinystories_train.bin \
+  --data-dtype uint16 \
+  --vocab-size 10000
+```
+
+## Windows scripts
+
+The Windows entrypoints are still available:
 
 - `scripts/run_tinystories_train.ps1`
 - `scripts/lr_sweep.ps1`

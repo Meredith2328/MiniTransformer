@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+UV_BIN="${UV_BIN:-uv}"
+
 usage() {
   cat <<'EOF'
 Usage: bash scripts/run_tinystories_train.sh [options]
@@ -11,9 +13,12 @@ Core options:
   --tokenizer-dir DIR                    (default: tokenizer)
   --runs-dir DIR                         (default: runs/tinystories_base)
   --train-txt FILE                       (default: TinyStoriesV2-GPT4-train.txt)
-  --val-txt FILE                         (default: TinyStoriesV2-GPT4-valid.txt)
+  --val-txt FILE                         (default: TinyStoriesV2-GPT4-valid.txt; empty disables validation)
+  --train-bin FILE                       (default: data/tinystories_train.bin)
+  --val-bin FILE                         (default: data/tinystories_val.bin; empty disables validation)
   --vocab-size INT                       (default: 10000)
   --special-tokens CSV                   (default: <|endoftext|>)
+  --data-dtype uint16|uint32|int32|int64 (default: uint16)
 
 Model and training options:
   --context-length INT                   (default: 256)
@@ -58,6 +63,54 @@ Pipeline control:
 EOF
 }
 
+resolve_path_arg() {
+  local base_dir="$1"
+  local raw_path="$2"
+
+  if [[ -z "$raw_path" ]]; then
+    printf ''
+    return
+  fi
+  if [[ "$raw_path" = /* || "$raw_path" == ./* || "$raw_path" == ../* || "$raw_path" == *"/"* ]]; then
+    printf '%s' "$raw_path"
+    return
+  fi
+  printf '%s/%s' "$base_dir" "$raw_path"
+}
+
+require_file() {
+  local label="$1"
+  local path="$2"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    echo "Missing ${label}: ${path}" >&2
+    exit 1
+  fi
+}
+
+activate_conda() {
+  if [[ -z "$CONDA_ENV" ]]; then
+    return
+  fi
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  if [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+    return
+  fi
+  echo "Warning: cannot activate conda env '$CONDA_ENV' automatically." >&2
+}
+
 CONDA_ENV=""
 DATA_DIR="data"
 TOKENIZER_DIR="tokenizer"
@@ -65,8 +118,14 @@ RUNS_DIR="runs/tinystories_base"
 
 TRAIN_TXT="TinyStoriesV2-GPT4-train.txt"
 VAL_TXT="TinyStoriesV2-GPT4-valid.txt"
+TRAIN_BIN="tinystories_train.bin"
+VAL_BIN="tinystories_val.bin"
+TRAIN_BIN_SET=0
+VAL_BIN_SET=0
+VAL_TXT_SET=0
 VOCAB_SIZE=10000
 SPECIAL_TOKENS="<|endoftext|>"
+DATA_DTYPE="uint16"
 
 CONTEXT_LENGTH=256
 D_MODEL=512
@@ -114,9 +173,12 @@ while [[ $# -gt 0 ]]; do
     --tokenizer-dir) TOKENIZER_DIR="$2"; shift 2 ;;
     --runs-dir) RUNS_DIR="$2"; shift 2 ;;
     --train-txt) TRAIN_TXT="$2"; shift 2 ;;
-    --val-txt) VAL_TXT="$2"; shift 2 ;;
+    --val-txt) VAL_TXT="$2"; VAL_TXT_SET=1; shift 2 ;;
+    --train-bin) TRAIN_BIN="$2"; TRAIN_BIN_SET=1; shift 2 ;;
+    --val-bin) VAL_BIN="$2"; VAL_BIN_SET=1; shift 2 ;;
     --vocab-size) VOCAB_SIZE="$2"; shift 2 ;;
     --special-tokens) SPECIAL_TOKENS="$2"; shift 2 ;;
+    --data-dtype) DATA_DTYPE="$2"; shift 2 ;;
     --context-length) CONTEXT_LENGTH="$2"; shift 2 ;;
     --d-model) D_MODEL="$2"; shift 2 ;;
     --num-heads) NUM_HEADS="$2"; shift 2 ;;
@@ -156,56 +218,45 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-activate_conda() {
-  if [[ -z "$CONDA_ENV" ]]; then
-    return
-  fi
-  if command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)"
-    conda activate "$CONDA_ENV"
-    return
-  fi
-  if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-    # shellcheck disable=SC1090
-    source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-    return
-  fi
-  if [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
-    # shellcheck disable=SC1090
-    source "$HOME/anaconda3/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-    return
-  fi
-  echo "Warning: cannot activate conda env '$CONDA_ENV' automatically." >&2
-}
-
 activate_conda
 
-TRAIN_TXT_PATH="${DATA_DIR}/${TRAIN_TXT}"
-VAL_TXT_PATH="${DATA_DIR}/${VAL_TXT}"
+TRAIN_TXT_PATH="$(resolve_path_arg "$DATA_DIR" "$TRAIN_TXT")"
+VAL_TXT_PATH="$(resolve_path_arg "$DATA_DIR" "$VAL_TXT")"
+TRAIN_BIN="$(resolve_path_arg "$DATA_DIR" "$TRAIN_BIN")"
+VAL_BIN="$(resolve_path_arg "$DATA_DIR" "$VAL_BIN")"
+
 VOCAB_PKL="${TOKENIZER_DIR}/tinystories_bpe_vocab.pkl"
 MERGES_PKL="${TOKENIZER_DIR}/tinystories_bpe_merges.pkl"
-TRAIN_BIN="${DATA_DIR}/tinystories_train.bin"
-VAL_BIN="${DATA_DIR}/tinystories_val.bin"
 TRAIN_META="${TRAIN_BIN}.meta.json"
 VAL_META="${VAL_BIN}.meta.json"
 
-mkdir -p "$TOKENIZER_DIR" "$DATA_DIR" "$RUNS_DIR"
-
-if [[ ! -f "$TRAIN_TXT_PATH" ]]; then
-  echo "Missing train txt: $TRAIN_TXT_PATH" >&2
-  exit 1
+USE_VAL=1
+if [[ "$VAL_BIN_SET" -eq 1 && -z "$VAL_BIN" ]]; then
+  USE_VAL=0
 fi
-if [[ ! -f "$VAL_TXT_PATH" ]]; then
-  echo "Missing val txt: $VAL_TXT_PATH" >&2
-  exit 1
+if [[ "$VAL_TXT_SET" -eq 1 && -z "$VAL_TXT_PATH" ]]; then
+  USE_VAL=0
+fi
+
+mkdir -p "$TOKENIZER_DIR" "$RUNS_DIR"
+mkdir -p "$(dirname "$TRAIN_BIN")"
+if [[ "$USE_VAL" -eq 1 && -n "$VAL_BIN" ]]; then
+  mkdir -p "$(dirname "$VAL_BIN")"
+fi
+if [[ -n "$DATA_DIR" ]]; then
+  mkdir -p "$DATA_DIR"
 fi
 
 if [[ "$SKIP_BPE" -eq 0 ]]; then
+  if [[ -z "$TRAIN_TXT_PATH" ]]; then
+    echo "BPE training requires --train-txt." >&2
+    exit 1
+  fi
+  require_file "train txt" "$TRAIN_TXT_PATH"
+
   echo "============================================================"
   echo "Step 1/3: train BPE tokenizer"
-  uv run python -m cs336_basics.train_bpe \
+  "$UV_BIN" run python -m cs336_basics.train_bpe \
     --input-path "$TRAIN_TXT_PATH" \
     --vocab-size "$VOCAB_SIZE" \
     --special-tokens "$SPECIAL_TOKENS" \
@@ -216,38 +267,63 @@ if [[ "$SKIP_BPE" -eq 0 ]]; then
     --merges-out "$MERGES_PKL"
 fi
 
-if [[ ! -f "$VOCAB_PKL" || ! -f "$MERGES_PKL" ]]; then
-  echo "Tokenizer files missing: $VOCAB_PKL or $MERGES_PKL" >&2
-  exit 1
-fi
-
 if [[ "$SKIP_TOKENIZE" -eq 0 ]]; then
+  if [[ -z "$TRAIN_TXT_PATH" ]]; then
+    echo "Tokenization requires --train-txt." >&2
+    exit 1
+  fi
+  require_file "train txt" "$TRAIN_TXT_PATH"
+  require_file "tokenizer vocab" "$VOCAB_PKL"
+  require_file "tokenizer merges" "$MERGES_PKL"
+
   echo "============================================================"
   echo "Step 2/3: tokenize txt -> bin"
-  uv run python scripts/tokenize_to_bin.py \
+  "$UV_BIN" run python scripts/tokenize_to_bin.py \
     --input-text "$TRAIN_TXT_PATH" \
     --vocab-pkl "$VOCAB_PKL" \
     --merges-pkl "$MERGES_PKL" \
     --output-bin "$TRAIN_BIN" \
     --output-meta "$TRAIN_META" \
     --special-tokens "$SPECIAL_TOKENS" \
-    --dtype uint16 \
+    --dtype "$DATA_DTYPE" \
     --progress-every-lines "$TOKENIZE_PROGRESS_EVERY_LINES"
 
-  uv run python scripts/tokenize_to_bin.py \
-    --input-text "$VAL_TXT_PATH" \
-    --vocab-pkl "$VOCAB_PKL" \
-    --merges-pkl "$MERGES_PKL" \
-    --output-bin "$VAL_BIN" \
-    --output-meta "$VAL_META" \
-    --special-tokens "$SPECIAL_TOKENS" \
-    --dtype uint16 \
-    --progress-every-lines "$TOKENIZE_PROGRESS_EVERY_LINES"
+  if [[ "$USE_VAL" -eq 1 ]]; then
+    if [[ -z "$VAL_TXT_PATH" ]]; then
+      echo "Validation tokenization requires --val-txt, or disable validation with --val-bin ''." >&2
+      exit 1
+    fi
+    require_file "val txt" "$VAL_TXT_PATH"
+
+    "$UV_BIN" run python scripts/tokenize_to_bin.py \
+      --input-text "$VAL_TXT_PATH" \
+      --vocab-pkl "$VOCAB_PKL" \
+      --merges-pkl "$MERGES_PKL" \
+      --output-bin "$VAL_BIN" \
+      --output-meta "$VAL_META" \
+      --special-tokens "$SPECIAL_TOKENS" \
+      --dtype "$DATA_DTYPE" \
+      --progress-every-lines "$TOKENIZE_PROGRESS_EVERY_LINES"
+  fi
+else
+  require_file "train bin" "$TRAIN_BIN"
+  if [[ "$USE_VAL" -eq 1 ]]; then
+    if [[ -f "$VAL_BIN" ]]; then
+      :
+    elif [[ "$VAL_BIN_SET" -eq 1 ]]; then
+      echo "Missing val bin: $VAL_BIN" >&2
+      exit 1
+    else
+      echo "Validation bin not found at $VAL_BIN. Continuing without validation."
+      USE_VAL=0
+      VAL_BIN=""
+    fi
+  fi
 fi
 
-if [[ ! -f "$TRAIN_BIN" || ! -f "$VAL_BIN" ]]; then
-  echo "Tokenized bin files missing: $TRAIN_BIN or $VAL_BIN" >&2
-  exit 1
+require_file "train bin" "$TRAIN_BIN"
+if [[ "$USE_VAL" -eq 1 ]]; then
+  require_file "val bin" "$VAL_BIN"
 fi
 
 tokens_per_step=$((BATCH_SIZE * CONTEXT_LENGTH))
@@ -258,10 +334,15 @@ if [[ -z "$WANDB_RUN_NAME" ]]; then
   WANDB_RUN_NAME="tinystories_base_bs${BATCH_SIZE}_ctx${CONTEXT_LENGTH}_$(date +%Y%m%d_%H%M%S)"
 fi
 
+val_display="(disabled)"
+if [[ "$USE_VAL" -eq 1 ]]; then
+  val_display="$VAL_BIN"
+fi
+
 echo "============================================================"
 echo "Step 3/3: train model"
 echo "train_bin: $TRAIN_BIN"
-echo "val_bin:   $VAL_BIN"
+echo "val_bin:   $val_display"
 echo "steps:     $steps"
 echo "warmup:    $warmup_iters"
 echo "save_dir:  $RUNS_DIR"
@@ -269,8 +350,7 @@ echo "save_dir:  $RUNS_DIR"
 train_args=(
   python -m cs336_basics.train
   --train-data "$TRAIN_BIN"
-  --val-data "$VAL_BIN"
-  --data-dtype uint16
+  --data-dtype "$DATA_DTYPE"
   --vocab-size "$VOCAB_SIZE"
   --context-length "$CONTEXT_LENGTH"
   --d-model "$D_MODEL"
@@ -299,6 +379,10 @@ train_args=(
   --seed "$SEED"
 )
 
+if [[ "$USE_VAL" -eq 1 ]]; then
+  train_args+=(--val-data "$VAL_BIN")
+fi
+
 if [[ "$USE_WANDB" -eq 1 ]]; then
   train_args+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-run-name "$WANDB_RUN_NAME" --wandb-mode "$WANDB_MODE")
   if [[ -n "$WANDB_ENTITY" ]]; then
@@ -306,7 +390,7 @@ if [[ "$USE_WANDB" -eq 1 ]]; then
   fi
 fi
 
-uv run "${train_args[@]}"
+"$UV_BIN" run "${train_args[@]}"
 
 echo "============================================================"
 echo "Done."
@@ -315,6 +399,6 @@ echo "  $VOCAB_PKL"
 echo "  $MERGES_PKL"
 echo "Tokenized data:"
 echo "  $TRAIN_BIN"
-echo "  $VAL_BIN"
+echo "  $val_display"
 echo "Checkpoints:"
 echo "  $RUNS_DIR"

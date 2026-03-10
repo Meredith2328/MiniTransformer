@@ -34,6 +34,7 @@ param(
     [int]$EvalIters = 50,
     [int]$LogInterval = 50,
     [int]$SaveInterval = 1000,
+    [int]$KeepLastCheckpoints = 3,
     [string]$Device = "auto",
     [int]$Seed = 1337,
 
@@ -49,6 +50,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$wrapperScript = Join-Path $PSScriptRoot "run_tinystories_train.ps1"
 
 function Parse-LrOverrides {
     param([string]$Raw)
@@ -83,11 +85,6 @@ if ($BatchSizes.Count -eq 0) {
 }
 if ($BaseBatchSize -le 0) {
     throw "BaseBatchSize must be positive."
-}
-
-if (Test-Path "C:\Software\Miniconda\shell\condabin\conda-hook.ps1") {
-    & C:\Software\Miniconda\shell\condabin\conda-hook.ps1
-    conda activate $CondaEnvPath
 }
 
 $lrMap = Parse-LrOverrides -Raw $LrOverrides
@@ -130,57 +127,70 @@ foreach ($batchSize in $BatchSizes) {
     Write-Host "Starting run: $runName"
     Write-Host "  batch_size=$batchSize lr=$lr min_lr=$minLr steps=$steps warmup=$warmupIters"
 
-    $trainArgs = @(
-        "python", "-m", "cs336_basics.train",
-        "--train-data", $TrainData,
-        "--data-dtype", $DataDtype,
-        "--vocab-size", $VocabSize,
-        "--context-length", $ContextLength,
-        "--d-model", $DModel,
-        "--num-heads", $NumHeads,
-        "--d-ff", $DFF,
-        "--num-layers", $NumLayers,
-        "--rope-theta", $RopeTheta,
-        "--batch-size", $batchSize,
-        "--total-iters", $steps,
-        "--learning-rate", $lr,
-        "--min-learning-rate", $minLr,
-        "--warmup-iters", $warmupIters,
-        "--beta1", $Beta1,
-        "--beta2", $Beta2,
-        "--eps", $Eps,
-        "--weight-decay", $WeightDecay,
-        "--grad-clip", $GradClip,
-        "--eval-interval", $EvalInterval,
-        "--eval-iters", $EvalIters,
-        "--log-interval", $LogInterval,
-        "--save-interval", $SaveInterval,
-        "--save-dir", $runDir,
-        "--device", $Device,
-        "--seed", $Seed
-    )
+    $wrapperParams = @{
+        CondaEnvPath = $CondaEnvPath
+        SkipBpe = $true
+        SkipTokenize = $true
+        TrainBin = $TrainData
+        DataDtype = $DataDtype
+        RunsDir = $runDir
+        VocabSize = $VocabSize
+        ContextLength = $ContextLength
+        DModel = $DModel
+        NumHeads = $NumHeads
+        DFF = $DFF
+        NumLayers = $NumLayers
+        RopeTheta = $RopeTheta
+        BatchSize = $batchSize
+        TokenBudget = $TokenBudget
+        LearningRate = $lr
+        MinLearningRate = $minLr
+        WarmupFraction = $WarmupFraction
+        Beta1 = $Beta1
+        Beta2 = $Beta2
+        Eps = $Eps
+        WeightDecay = $WeightDecay
+        GradClip = $GradClip
+        EvalInterval = $EvalInterval
+        EvalIters = $EvalIters
+        LogInterval = $LogInterval
+        SaveInterval = $SaveInterval
+        KeepLastCheckpoints = $KeepLastCheckpoints
+        Device = $Device
+        Seed = $Seed
+    }
 
     if ($ValData) {
-        $trainArgs += @("--val-data", $ValData)
+        $wrapperParams.ValBin = $ValData
+    }
+    else {
+        $wrapperParams.ValBin = ""
+        $wrapperParams.ValTxt = ""
     }
 
     if ($UseWandb) {
-        $trainArgs += @("--wandb", "--wandb-project", $WandbProject, "--wandb-run-name", $runName, "--wandb-mode", $WandbMode)
+        $wrapperParams.UseWandb = $true
+        $wrapperParams.WandbProject = $WandbProject
+        $wrapperParams.WandbRunName = $runName
+        $wrapperParams.WandbMode = $WandbMode
         if ($WandbEntity) {
-            $trainArgs += @("--wandb-entity", $WandbEntity)
+            $wrapperParams.WandbEntity = $WandbEntity
         }
     }
 
-    & uv run @trainArgs
-    $exitCode = $LASTEXITCODE
+    try {
+        & $wrapperScript @wrapperParams
+        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    }
+    catch {
+        $exitCode = 1
+        Write-Warning "Run failed ($runName), exit_code=$exitCode. Continuing to next batch size."
+        Write-Warning $_.Exception.Message
+    }
 
     $end = Get-Date
     $durationSec = [int]($end - $start).TotalSeconds
     "$runName,$batchSize,$lr,$minLr,$steps,$warmupIters,$runDir,$exitCode,$($start.ToString("s")),$($end.ToString("s")),$durationSec" | Add-Content -Path $resultsCsv
-
-    if ($exitCode -ne 0) {
-        Write-Warning "Run failed ($runName), exit_code=$exitCode. Continuing to next batch size."
-    }
 }
 
 Write-Host "Batch sweep complete. Summary: $resultsCsv"

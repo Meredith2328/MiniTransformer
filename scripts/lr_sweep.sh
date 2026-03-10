@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   cat <<'EOF'
 Usage: bash scripts/lr_sweep.sh --train-data PATH [options]
@@ -32,6 +34,7 @@ Optional:
   --eval-iters INT                             (default: 50)
   --log-interval INT                           (default: 50)
   --save-interval INT                          (default: 1000)
+  --keep-last-checkpoints INT                  (default: 3)
   --device auto|cpu|cuda                       (default: auto)
   --seed INT                                   (default: 1337)
   --save-root DIR                              (default: runs/lr_sweep)
@@ -68,6 +71,7 @@ EVAL_INTERVAL=500
 EVAL_ITERS=50
 LOG_INTERVAL=50
 SAVE_INTERVAL=1000
+KEEP_LAST_CHECKPOINTS=3
 DEVICE="auto"
 SEED=1337
 SAVE_ROOT="runs/lr_sweep"
@@ -103,6 +107,7 @@ while [[ $# -gt 0 ]]; do
     --eval-iters) EVAL_ITERS="$2"; shift 2 ;;
     --log-interval) LOG_INTERVAL="$2"; shift 2 ;;
     --save-interval) SAVE_INTERVAL="$2"; shift 2 ;;
+    --keep-last-checkpoints) KEEP_LAST_CHECKPOINTS="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --save-root) SAVE_ROOT="$2"; shift 2 ;;
@@ -128,13 +133,6 @@ fi
 if [[ -n "$VAL_DATA" && ! -f "$VAL_DATA" ]]; then
   echo "Val data not found: $VAL_DATA" >&2
   exit 1
-fi
-
-if [[ -n "$CONDA_ENV" ]]; then
-  if command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)"
-    conda activate "$CONDA_ENV"
-  fi
 fi
 
 IFS=',' read -r -a lr_values <<< "$LEARNING_RATES"
@@ -171,10 +169,13 @@ for lr in "${lr_values[@]}"; do
   echo "Starting run: $run_name"
   echo "  lr=$lr min_lr=$min_lr steps=$steps warmup=$warmup_iters"
 
-  train_args=(
-    python -m cs336_basics.train
-    --train-data "$TRAIN_DATA"
+  wrapper_args=(
+    bash "${SCRIPT_DIR}/run_tinystories_train.sh"
+    --skip-bpe
+    --skip-tokenize
+    --train-bin "$TRAIN_DATA"
     --data-dtype "$DATA_DTYPE"
+    --runs-dir "$run_dir"
     --vocab-size "$VOCAB_SIZE"
     --context-length "$CONTEXT_LENGTH"
     --d-model "$D_MODEL"
@@ -183,10 +184,10 @@ for lr in "${lr_values[@]}"; do
     --num-layers "$NUM_LAYERS"
     --rope-theta "$ROPE_THETA"
     --batch-size "$BATCH_SIZE"
-    --total-iters "$steps"
+    --token-budget "$TOKEN_BUDGET"
     --learning-rate "$lr"
     --min-learning-rate "$min_lr"
-    --warmup-iters "$warmup_iters"
+    --warmup-fraction "$WARMUP_FRACTION"
     --beta1 "$BETA1"
     --beta2 "$BETA2"
     --eps "$EPS"
@@ -196,21 +197,27 @@ for lr in "${lr_values[@]}"; do
     --eval-iters "$EVAL_ITERS"
     --log-interval "$LOG_INTERVAL"
     --save-interval "$SAVE_INTERVAL"
-    --save-dir "$run_dir"
+    --keep-last-checkpoints "$KEEP_LAST_CHECKPOINTS"
     --device "$DEVICE"
     --seed "$SEED"
   )
+
+  if [[ -n "$CONDA_ENV" ]]; then
+    wrapper_args+=(--conda-env "$CONDA_ENV")
+  fi
   if [[ -n "$VAL_DATA" ]]; then
-    train_args+=(--val-data "$VAL_DATA")
+    wrapper_args+=(--val-bin "$VAL_DATA")
+  else
+    wrapper_args+=(--val-bin "" --val-txt "")
   fi
   if [[ "$USE_WANDB" -eq 1 ]]; then
-    train_args+=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-run-name "$run_name" --wandb-mode "$WANDB_MODE")
+    wrapper_args+=(--use-wandb --wandb-project "$WANDB_PROJECT" --wandb-run-name "$run_name" --wandb-mode "$WANDB_MODE")
     if [[ -n "$WANDB_ENTITY" ]]; then
-      train_args+=(--wandb-entity "$WANDB_ENTITY")
+      wrapper_args+=(--wandb-entity "$WANDB_ENTITY")
     fi
   fi
 
-  if uv run "${train_args[@]}"; then
+  if "${wrapper_args[@]}"; then
     exit_code=0
   else
     exit_code=$?
