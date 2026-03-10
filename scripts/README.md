@@ -8,6 +8,10 @@ This folder now includes a small `cProfile` workflow for practicing tokenization
   - Generates a `.prof` file for a chosen tokenization workload.
 - `scripts/inspect_profile.py`
   - Reads a saved `.prof` file and prints stats, callers, or callees.
+- `scripts/run_tokenization_profile_experiment.ps1`
+  - Re-runs the fixed TinyStories profiling experiment used in the report below.
+- `scripts/TOKENIZATION_PROFILING_EXPERIMENT.md`
+  - Records one actual profiling run, the commands used, and the observed bottlenecks.
 - `scripts/tokenize_to_bin.py`
   - Your normal tokenization entrypoint. The profiling script reuses its tokenizer-loading logic.
 
