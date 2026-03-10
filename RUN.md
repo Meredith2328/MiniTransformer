@@ -54,6 +54,8 @@ uv run python scripts/resume_training.py \
 
 By default this script looks for `run_config.json` in the same directory as the checkpoint, rebuilds the original training command, and adds `--resume <checkpoint>`.
 
+Resume also restores the saved best-validation record from the checkpoint metadata, so `best.pt` will not be overwritten by a worse validation score after restart.
+
 Recommended checkpoint choice:
 
 - `latest.pt`: normal resume target

@@ -231,6 +231,13 @@ def maybe_init_wandb(args: argparse.Namespace, run_config: dict[str, Any], run_d
     )
 
 
+def build_checkpoint_extra_state(best_val_loss: float, best_step: int) -> dict[str, Any]:
+    return {
+        "best_val_loss": best_val_loss,
+        "best_step": best_step,
+    }
+
+
 def train(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
 
@@ -265,10 +272,20 @@ def train(args: argparse.Namespace) -> None:
     print(f"Trainable parameters: {trainable_params:,}")
 
     start_step = 1
+    best_val_loss = float("inf")
+    best_step = 0
     if args.resume:
-        resumed_iter = load_checkpoint(args.resume, model, optimizer)
+        resumed_checkpoint = load_checkpoint(args.resume, model, optimizer, return_checkpoint=True)
+        resumed_iter = int(resumed_checkpoint["iteration"])
         start_step = int(resumed_iter) + 1
+        extra_state = resumed_checkpoint.get("extra_state", {})
+        if "best_val_loss" in extra_state:
+            best_val_loss = float(extra_state["best_val_loss"])
+        if "best_step" in extra_state:
+            best_step = int(extra_state["best_step"])
         print(f"Resumed from checkpoint {args.resume}, continuing at step {start_step}.")
+        if best_step > 0 and np.isfinite(best_val_loss):
+            print(f"Recovered best validation loss {best_val_loss:.4f} from step {best_step}.")
 
     run_config = vars(args).copy()
     run_config["resolved_device"] = device
@@ -278,8 +295,6 @@ def train(args: argparse.Namespace) -> None:
     wandb_run = maybe_init_wandb(args, run_config, save_dir)
 
     model.train()
-    best_val_loss = float("inf")
-    best_step = 0
     last_completed_step = start_step - 1
 
     window_losses: list[float] = []
@@ -356,13 +371,20 @@ def train(args: argparse.Namespace) -> None:
                     best_val_loss = val_loss
                     best_step = step
                     best_path = save_dir / "best.pt"
-                    save_checkpoint(model, optimizer, step, best_path)
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        step,
+                        best_path,
+                        extra_state=build_checkpoint_extra_state(best_val_loss, best_step),
+                    )
                     print(f"  saved new best checkpoint to {best_path} (val_loss={val_loss:.4f})")
 
             if step % args.save_interval == 0:
                 ckpt_path = save_dir / f"step_{step:08d}.pt"
-                save_checkpoint(model, optimizer, step, ckpt_path)
-                save_checkpoint(model, optimizer, step, save_dir / "latest.pt")
+                extra_state = build_checkpoint_extra_state(best_val_loss, best_step)
+                save_checkpoint(model, optimizer, step, ckpt_path, extra_state=extra_state)
+                save_checkpoint(model, optimizer, step, save_dir / "latest.pt", extra_state=extra_state)
                 print(f"  checkpoint saved: {ckpt_path}")
                 removed = prune_old_step_checkpoints(save_dir, args.keep_last_checkpoints)
                 if removed:
@@ -371,7 +393,13 @@ def train(args: argparse.Namespace) -> None:
 
     except KeyboardInterrupt:
         interrupted_path = save_dir / f"interrupted_step_{last_completed_step:08d}.pt"
-        save_checkpoint(model, optimizer, last_completed_step, interrupted_path)
+        save_checkpoint(
+            model,
+            optimizer,
+            last_completed_step,
+            interrupted_path,
+            extra_state=build_checkpoint_extra_state(best_val_loss, best_step),
+        )
         print(f"\nInterrupted. Saved checkpoint to {interrupted_path}")
         raise
     finally:
@@ -379,7 +407,13 @@ def train(args: argparse.Namespace) -> None:
             wandb_run.finish()
 
     final_path = save_dir / "final.pt"
-    save_checkpoint(model, optimizer, last_completed_step, final_path)
+    save_checkpoint(
+        model,
+        optimizer,
+        last_completed_step,
+        final_path,
+        extra_state=build_checkpoint_extra_state(best_val_loss, best_step),
+    )
     total_seconds = time.perf_counter() - train_start_time
     print(f"Training complete in {total_seconds:.1f}s. Final checkpoint: {final_path}")
     if val_dataset is not None and best_step > 0:

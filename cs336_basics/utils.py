@@ -124,7 +124,8 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     iteration: int,
-    out: Union[str, os.PathLike, BinaryIO, IO[bytes]]
+    out: Union[str, os.PathLike, BinaryIO, IO[bytes]],
+    extra_state: Optional[dict[str, Any]] = None,
 ) -> None:
     """
     保存训练检查点
@@ -140,6 +141,8 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'iteration': iteration
     }
+    if extra_state is not None:
+        checkpoint['extra_state'] = dict(extra_state)
     
     torch.save(checkpoint, out)
 
@@ -147,8 +150,9 @@ def save_checkpoint(
 def load_checkpoint(
     src: Union[str, os.PathLike, BinaryIO, IO[bytes]],
     model: nn.Module,
-    optimizer: torch.optim.Optimizer
-) -> int:
+    optimizer: torch.optim.Optimizer,
+    return_checkpoint: bool = False,
+) -> Union[int, dict[str, Any]]:
     """
     加载训练检查点
     
@@ -164,5 +168,6 @@ def load_checkpoint(
     
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
+    if return_checkpoint:
+        return checkpoint
     return checkpoint['iteration']
