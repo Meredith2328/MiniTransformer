@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640">
+  <rect width="1200" height="640" fill="#f8f2ea"/>
+  <rect x="40" y="40" width="1120" height="560" rx="20" fill="#fffaf4" stroke="#3b2f2f" stroke-width="4"/>
+  <text x="80" y="120" font-family="Georgia, serif" font-size="42" fill="#3b2f2f">Learning Rate Sweep Placeholder</text>
+  <text x="80" y="180" font-family="Consolas, monospace" font-size="24" fill="#5d4d4d">Replace with multiple learning rate curves from W&amp;B or exported plots.</text>
+  <text x="80" y="225" font-family="Consolas, monospace" font-size="24" fill="#5d4d4d">Suggested content: stable runs, best run, and at least one divergent run.</text>
+  <line x1="120" y1="500" x2="1080" y2="500" stroke="#a38f8f" stroke-width="4"/>
+  <line x1="120" y1="500" x2="120" y2="220" stroke="#a38f8f" stroke-width="4"/>
+  <path d="M140 460 C260 390, 360 330, 520 250 S820 160, 1040 135" fill="none" stroke="#2563eb" stroke-width="7"/>
+  <path d="M140 470 C250 410, 360 360, 520 315 S820 260, 1040 240" fill="none" stroke="#059669" stroke-width="7"/>
+  <path d="M140 465 C240 395, 330 340, 430 315 S610 330, 700 370 S860 470, 1040 520" fill="none" stroke="#dc2626" stroke-width="7"/>
+  <text x="860" y="130" font-family="Consolas, monospace" font-size="24" fill="#2563eb">best LR</text>
+  <text x="860" y="165" font-family="Consolas, monospace" font-size="24" fill="#059669">stable LR</text>
+  <text x="860" y="200" font-family="Consolas, monospace" font-size="24" fill="#dc2626">divergent LR</text>
+</svg>
