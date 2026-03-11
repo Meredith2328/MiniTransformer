@@ -1,5 +1,9 @@
 # MiniTransformer From Scratch
 
+[CS336 Assignment 1 前半段记录：架构 | 十派的玩具箱](https://meredith2328.github.io/post/CS336-hw1-1/)
+
+[CS336 Assignment 1 后半段记录：实验 | 十派的玩具箱](https://meredith2328.github.io/post/CS336-hw1-2/)
+
 This repository is a personal implementation project built on top of [Stanford CS336 Assignment 1](https://github.com/stanford-cs336/assignment1-basics/) . It turns the assignment components into a runnable small-scale language model training stack, from raw text to experiment tracking.
 
 Current scope:
