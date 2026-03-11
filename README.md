@@ -1,6 +1,6 @@
 # MiniTransformer From Scratch
 
-This repository is a personal implementation project built on top of Stanford CS336 Assignment 1. It turns the assignment components into a runnable small-scale language model training stack, from raw text to experiment tracking.
+This repository is a personal implementation project built on top of [Stanford CS336 Assignment 1](https://github.com/stanford-cs336/assignment1-basics/) . It turns the assignment components into a runnable small-scale language model training stack, from raw text to experiment tracking.
 
 Current scope:
 
@@ -18,14 +18,15 @@ For full training commands, see [RUN.md](./RUN.md).
 PowerShell:
 
 ```powershell
-& C:\Software\Miniconda\shell\condabin\conda-hook.ps1
-conda activate C:\Software\Miniconda\envs\cs336
+conda create -n cs336 python==3.12
+conda activate cs336
 uv sync
 ```
 
 Linux:
 
 ```bash
+conda create -n cs336 python==3.12
 conda activate cs336
 uv sync
 ```
@@ -129,35 +130,25 @@ Checkpoint policy:
 
 ## Results
 
-You can fill in the final metrics here:
-
 | Metric | Value |
 | --- | --- |
-| Best validation per-token loss | `TODO` |
-| Best hyperparameter setting | `TODO` |
-| Peak training throughput | `TODO` |
-| Tokenizer training / encoding speed | `TODO` |
-| W&B run URL | `TODO` |
+| Best validation per-token loss | 1.37 |
+| Best hyperparameter setting | batch size=128, lr = 0.0012, context_length = 256 |
+| Peak training throughput | 260,000 tok/s |
+| Tokenizer training / encoding speed | 3MB/s (one thread) |
 
-### TinyStories Train / Val Loss
+### TinyStories Val Loss
 
-![TinyStories Loss Placeholder](./docs/figures/tinystories_loss_placeholder.svg)
+![TinyStories Loss Placeholder](./docs/figures/tinystories_val_loss.png)
 
 ### Learning Rate Sweep
 
-![Learning Rate Sweep Placeholder](./docs/figures/lr_sweep_placeholder.svg)
+![Batch Size Sweep Placeholder](./docs/figures/lr_sweep.png)
 
 ### Batch Size Sweep
 
-![Batch Size Sweep Placeholder](./docs/figures/batch_sweep_placeholder.svg)
+![Batch Size Sweep Placeholder](./docs/figures/bs_sweep.png)
 
-### Throughput / Profiling Summary
+## license
 
-![Throughput Placeholder](./docs/figures/throughput_placeholder.svg)
-
-## Notes
-
-- start from [RUN.md](./RUN.md) if you want the full baseline commands
-- tokenizer profiling notes are in [`scripts/README.md`](./scripts/README.md)
-- the original course handout is in [`cs336_spring2025_assignment1_basics.pdf`](./cs336_spring2025_assignment1_basics.pdf)
-- license: [`LICENSE`](./LICENSE)
+MIT
