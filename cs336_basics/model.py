@@ -425,6 +425,181 @@ class TransformerLM(nn.Module):
         logits = self.lm_head(x)  # [batch, seq_len, vocab_size]
         
         return logits
+
+
+class IdentityNorm(nn.Module):
+    """Drop-in replacement for norm layers when an ablation removes normalization."""
+
+    def forward(self, x):
+        return x
+
+
+class SiLUFeedForward(nn.Module):
+    """Two-layer FFN with SiLU activation."""
+
+    def __init__(self, d_model, d_ff=None, device=None, dtype=None):
+        super().__init__()
+        if d_ff is None:
+            d_ff = int((8 / 3) * d_model)
+            d_ff = ((d_ff + 63) // 64) * 64
+
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.activation = SiLU()
+
+    def forward(self, x):
+        orig_dtype = x.dtype
+        x = x.float()
+        output = self.w2(self.activation(self.w1(x)))
+        return output.to(orig_dtype)
+
+
+def build_norm_layer(d_model, use_rmsnorm=True, device=None, dtype=None):
+    if use_rmsnorm:
+        return RMSNorm(d_model, device=device, dtype=dtype)
+    return IdentityNorm()
+
+
+def build_feedforward_layer(ffn_activation, d_model, d_ff, device=None, dtype=None):
+    if ffn_activation == "swiglu":
+        return SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+    if ffn_activation == "silu":
+        return SiLUFeedForward(d_model, d_ff, device=device, dtype=dtype)
+    raise ValueError(f"Unsupported ffn_activation: {ffn_activation}")
+
+
+class ConfigurableTransformerBlock(nn.Module):
+    """Transformer block with pluggable norm placement, RoPE, and FFN type."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float = 10000.0,
+        max_seq_len: int = 2048,
+        use_rmsnorm: bool = True,
+        norm_order: str = "pre",
+        use_rope: bool = True,
+        ffn_activation: str = "swiglu",
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if norm_order not in {"pre", "post"}:
+            raise ValueError(f"Unsupported norm_order: {norm_order}")
+
+        self.norm_order = norm_order
+        self.norm1 = build_norm_layer(d_model, use_rmsnorm=use_rmsnorm, device=device, dtype=dtype)
+        self.attention = MultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            use_rope=use_rope,
+            theta=theta,
+            max_seq_len=max_seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        self.norm2 = build_norm_layer(d_model, use_rmsnorm=use_rmsnorm, device=device, dtype=dtype)
+        self.ffn = build_feedforward_layer(
+            ffn_activation=ffn_activation,
+            d_model=d_model,
+            d_ff=d_ff,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x, token_positions=None):
+        if self.norm_order == "pre":
+            x = x + self.attention(self.norm1(x), token_positions)
+            x = x + self.ffn(self.norm2(x))
+            return x
+
+        x = self.norm1(x + self.attention(x, token_positions))
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+
+class ConfigurableTransformerLM(nn.Module):
+    """Transformer LM with ablation-friendly switches for norm, RoPE, and FFN."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        num_layers: int,
+        theta: float = 10000.0,
+        use_rmsnorm: bool = True,
+        norm_order: str = "pre",
+        use_rope: bool = True,
+        ffn_activation: str = "swiglu",
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if norm_order not in {"pre", "post"}:
+            raise ValueError(f"Unsupported norm_order: {norm_order}")
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.theta = theta
+        self.use_rmsnorm = use_rmsnorm
+        self.norm_order = norm_order
+        self.use_rope = use_rope
+        self.ffn_activation = ffn_activation
+
+        self.token_embedding = Embedding(
+            vocab_size,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.layers = nn.ModuleList(
+            [
+                ConfigurableTransformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    theta=theta,
+                    max_seq_len=context_length,
+                    use_rmsnorm=use_rmsnorm,
+                    norm_order=norm_order,
+                    use_rope=use_rope,
+                    ffn_activation=ffn_activation,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = build_norm_layer(d_model, use_rmsnorm=use_rmsnorm, device=device, dtype=dtype)
+        self.lm_head = Linear(
+            d_model,
+            vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(
+        self,
+        token_ids: Int[Tensor, "batch seq_len"],
+        token_positions: Int[Tensor, "batch seq_len"] | None = None,
+    ) -> Float[Tensor, "batch seq_len vocab_size"]:
+        x = self.token_embedding(token_ids)
+
+        for layer in self.layers:
+            x = layer(x, token_positions)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        return logits
         
 class CrossEntropyLoss(nn.Module):
     def __init__(self):
