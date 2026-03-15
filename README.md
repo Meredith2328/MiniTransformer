@@ -112,6 +112,21 @@ uv run python scripts/overfit_single_batch.py \
   --vocab-size 10000
 ```
 
+Prompt-based generation:
+
+```bash
+uv run python scripts/generate_prompt.py \
+  --run-dir runs/tinystories_base \
+  --prompt "Once upon a time"
+```
+
+Local web UI:
+
+```bash
+uv run python ask.py \
+  --run-dir runs/tinystories_base
+```
+
 ## Training Notes
 
 A typical run directory contains:

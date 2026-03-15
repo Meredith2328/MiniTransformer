@@ -261,12 +261,10 @@ def generate(
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             window_ids = generated_ids[-context_length:]
-            window_start = len(generated_ids) - len(window_ids)
 
             input_ids = torch.tensor([window_ids], dtype=torch.long, device=device)
             token_positions = torch.arange(
-                window_start,
-                window_start + len(window_ids),
+                len(window_ids),
                 device=device,
                 dtype=torch.long,
             ).unsqueeze(0)
